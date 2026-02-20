@@ -1,5 +1,6 @@
 import os
 import time
+import base64
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -7,7 +8,6 @@ from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
-# ENV VARS
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("VEO3_API_KEY")
@@ -15,7 +15,6 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("VEO3_API_KE
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY or not GEMINI_API_KEY:
     raise Exception("Missing required environment variables")
 
-# Init Gemini client
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 app = FastAPI()
@@ -52,7 +51,7 @@ def update_generation(generation_id, status, final_video_url=None):
         raise Exception(res.text)
 
 
-def download_file(url):
+def download_image_bytes(url):
 
     res = requests.get(url, timeout=60)
 
@@ -60,6 +59,17 @@ def download_file(url):
         raise Exception("Failed to download image")
 
     return res.content
+
+
+def detect_mime(image_bytes):
+
+    if image_bytes[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+
+    if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+
+    return "image/jpeg"
 
 
 @app.post("/generate-video")
@@ -73,39 +83,36 @@ def generate_video(req: GenerateVideoRequest):
 
         update_generation(generation_id, "processing")
 
-        # download image
         print("Downloading image...")
-        image_bytes = download_file(req.image_url)
+        image_bytes = download_image_bytes(req.image_url)
 
-        local_path = f"/tmp/{generation_id}.jpg"
+        mime_type = detect_mime(image_bytes)
 
-        with open(local_path, "wb") as f:
-            f.write(image_bytes)
+        print("Creating Veo Image object...")
 
-        # upload to Gemini Files API
-        print("Uploading image to Gemini Files API...")
-        uploaded_file = client.files.upload(file=local_path)
+        veo_image = types.Image.from_bytes(
+            data=image_bytes,
+            mime_type=mime_type
+        )
 
-        # build prompt
         full_prompt = req.prompt
 
         if req.script_text:
             full_prompt += f"\n\nCharacter speaking naturally in Brazilian Portuguese:\n{req.script_text}"
 
-        # generate video (CORRECT CONFIG STRUCTURE)
         print("Generating video via Veo 3.1...")
 
         operation = client.models.generate_videos(
             model="veo-3.1-generate-preview",
             prompt=full_prompt,
-            image=uploaded_file,
+            image=veo_image,
             config=types.GenerateVideosConfig(
                 aspect_ratio=req.aspect_ratio
             )
         )
 
-        # poll operation
-        print("Waiting for Veo...")
+        print("Waiting for Veo completion...")
+
         while not operation.done:
             time.sleep(10)
             operation = client.operations.get(operation)
@@ -115,15 +122,14 @@ def generate_video(req: GenerateVideoRequest):
 
         video_file = operation.response.generated_videos[0].video
 
-        output_path = f"/tmp/{generation_id}.mp4"
+        local_path = f"/tmp/{generation_id}.mp4"
 
         client.files.download(
             file=video_file,
-            path=output_path
+            path=local_path
         )
 
-        # upload to Supabase Storage
-        print("Uploading to Supabase Storage...")
+        print("Uploading video to Supabase Storage...")
 
         storage_url = f"{SUPABASE_URL}/storage/v1/object/creative-media/video-final/{generation_id}.mp4"
 
@@ -134,7 +140,7 @@ def generate_video(req: GenerateVideoRequest):
             "x-upsert": "true"
         }
 
-        with open(output_path, "rb") as f:
+        with open(local_path, "rb") as f:
 
             upload_res = requests.post(
                 storage_url,
@@ -153,7 +159,7 @@ def generate_video(req: GenerateVideoRequest):
             public_url
         )
 
-        print(f"SUCCESS: {public_url}")
+        print("SUCCESS:", public_url)
 
         return {
             "status": "completed",
