@@ -1,6 +1,5 @@
 import os
 import time
-import base64
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -21,9 +20,9 @@ class GenerateVideoRequest(BaseModel):
     duration: int
 
 
-# =====================
-# SUPABASE UPDATE
-# =====================
+# ========================
+# Update Supabase
+# ========================
 
 def update_generation(generation_id, status, final_video_url=None):
 
@@ -44,34 +43,57 @@ def update_generation(generation_id, status, final_video_url=None):
     requests.patch(url, json=payload, headers=headers)
 
 
-# =====================
-# DOWNLOAD IMAGE BASE64
-# =====================
+# ========================
+# Upload image to Gemini Files API
+# ========================
 
-def download_image_base64(url):
+def upload_image_to_gemini(image_url):
 
-    res = requests.get(url)
+    print("Downloading source image")
+
+    image = requests.get(image_url)
+
+    if image.status_code != 200:
+        raise Exception("Failed to download image")
+
+    print("Uploading to Gemini Files API")
+
+    upload_url = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+
+    headers = {
+        "x-goog-api-key": GEMINI_API_KEY
+    }
+
+    files = {
+        "file": ("image.jpg", image.content, "image/jpeg")
+    }
+
+    res = requests.post(upload_url, headers=headers, files=files)
 
     if res.status_code != 200:
-        raise Exception("Failed to download source image")
+        raise Exception(res.text)
 
-    return base64.b64encode(res.content).decode("utf-8")
+    file_uri = res.json()["file"]["uri"]
+
+    print("Uploaded file_uri:", file_uri)
+
+    return file_uri
 
 
-# =====================
-# GENERATE VIDEO
-# =====================
+# ========================
+# Generate video
+# ========================
 
 @app.post("/generate-video")
 def generate_video(req: GenerateVideoRequest):
 
     try:
 
-        print("Starting Veo3 generation:", req.generation_id)
+        print("Starting generation:", req.generation_id)
 
         update_generation(req.generation_id, "processing")
 
-        image_base64 = download_image_base64(req.image_url)
+        file_uri = upload_image_to_gemini(req.image_url)
 
         endpoint = (
             "https://generativelanguage.googleapis.com/v1beta/"
@@ -86,35 +108,44 @@ def generate_video(req: GenerateVideoRequest):
         full_prompt = f"""
 {req.prompt}
 
-Script (spoken naturally in Brazilian Portuguese):
+Script (Brazilian Portuguese):
 {req.script_text}
 
 Requirements:
-- perfect lip sync
-- natural speech timing
-- realistic facial movement
-- cinematic realism
+perfect lip sync
+photorealistic
+cinematic
+natural speech timing
 """
 
         payload = {
+
             "instances": [
+
                 {
                     "prompt": full_prompt,
+
                     "image": {
-                        "inlineData": {
+
+                        "fileData": {
+
                             "mimeType": "image/jpeg",
-                            "data": image_base64
+                            "fileUri": file_uri
+
                         }
                     }
                 }
             ],
+
             "parameters": {
+
                 "aspectRatio": req.aspect_ratio,
                 "durationSeconds": req.duration
+
             }
         }
 
-        print("Submitting to Veo3")
+        print("Submitting Veo3 job")
 
         response = requests.post(endpoint, json=payload, headers=headers)
 
@@ -153,11 +184,13 @@ Requirements:
                 )
 
                 return {
+
                     "status": "completed",
                     "video_url": video_uri
+
                 }
 
-            print("Still generating...")
+            print("Still processing")
 
             time.sleep(10)
 
