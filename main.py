@@ -1,20 +1,16 @@
 import os
 import time
+import base64
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# ENV VARS
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-GEMINI_API_KEY = os.environ.get("VEO3_API_KEY")  # sua Gemini API Key
+GEMINI_API_KEY = os.environ.get("VEO3_API_KEY")
 
 app = FastAPI()
 
-
-# =========================
-# REQUEST MODEL
-# =========================
 
 class GenerateVideoRequest(BaseModel):
     generation_id: str
@@ -25,17 +21,15 @@ class GenerateVideoRequest(BaseModel):
     duration: int
 
 
-# =========================
+# =====================
 # SUPABASE UPDATE
-# =========================
+# =====================
 
 def update_generation(generation_id, status, final_video_url=None):
 
     url = f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{generation_id}"
 
-    payload = {
-        "status": status
-    }
+    payload = {"status": status}
 
     if final_video_url:
         payload["final_video_url"] = final_video_url
@@ -47,15 +41,26 @@ def update_generation(generation_id, status, final_video_url=None):
         "Prefer": "return=minimal"
     }
 
-    res = requests.patch(url, json=payload, headers=headers)
-
-    if res.status_code not in [200, 204]:
-        print("Supabase update failed:", res.text)
+    requests.patch(url, json=payload, headers=headers)
 
 
-# =========================
-# VEO3 GENERATION
-# =========================
+# =====================
+# DOWNLOAD IMAGE BASE64
+# =====================
+
+def download_image_base64(url):
+
+    res = requests.get(url)
+
+    if res.status_code != 200:
+        raise Exception("Failed to download source image")
+
+    return base64.b64encode(res.content).decode("utf-8")
+
+
+# =====================
+# GENERATE VIDEO
+# =====================
 
 @app.post("/generate-video")
 def generate_video(req: GenerateVideoRequest):
@@ -66,8 +71,9 @@ def generate_video(req: GenerateVideoRequest):
 
         update_generation(req.generation_id, "processing")
 
-        # Endpoint oficial Veo3
-        url = (
+        image_base64 = download_image_base64(req.image_url)
+
+        endpoint = (
             "https://generativelanguage.googleapis.com/v1beta/"
             "models/veo-3.1-generate-preview:predictLongRunning"
         )
@@ -77,7 +83,6 @@ def generate_video(req: GenerateVideoRequest):
             "Content-Type": "application/json"
         }
 
-        # Prompt completo com script embutido
         full_prompt = f"""
 {req.prompt}
 
@@ -85,11 +90,10 @@ Script (spoken naturally in Brazilian Portuguese):
 {req.script_text}
 
 Requirements:
-- Perfect lip sync
-- Natural facial motion
-- Realistic human behavior
-- Cinematic lighting
-- Photorealistic
+- perfect lip sync
+- natural speech timing
+- realistic facial movement
+- cinematic realism
 """
 
         payload = {
@@ -97,7 +101,10 @@ Requirements:
                 {
                     "prompt": full_prompt,
                     "image": {
-                        "uri": req.image_url
+                        "inlineData": {
+                            "mimeType": "image/jpeg",
+                            "data": image_base64
+                        }
                     }
                 }
             ],
@@ -107,29 +114,22 @@ Requirements:
             }
         }
 
-        print("Submitting to Veo3...")
+        print("Submitting to Veo3")
 
-        response = requests.post(url, json=payload, headers=headers, timeout=60)
+        response = requests.post(endpoint, json=payload, headers=headers)
 
         if response.status_code != 200:
             raise Exception(response.text)
 
-        operation = response.json()
+        operation = response.json()["name"]
 
-        operation_name = operation["name"]
+        print("Operation:", operation)
 
-        print("Operation:", operation_name)
-
-        # Poll operation
-        poll_url = f"https://generativelanguage.googleapis.com/v1beta/{operation_name}"
+        poll_url = f"https://generativelanguage.googleapis.com/v1beta/{operation}"
 
         while True:
 
-            poll = requests.get(
-                poll_url,
-                headers=headers,
-                timeout=60
-            )
+            poll = requests.get(poll_url, headers=headers)
 
             if poll.status_code != 200:
                 raise Exception(poll.text)
@@ -140,7 +140,8 @@ Requirements:
 
                 video_uri = (
                     data["response"]["candidates"][0]
-                    ["content"]["parts"][0]["fileData"]["uri"]
+                    ["content"]["parts"][0]
+                    ["fileData"]["uri"]
                 )
 
                 print("Video ready:", video_uri)
