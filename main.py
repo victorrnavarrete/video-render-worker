@@ -9,15 +9,13 @@ from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
-# ENV VARIABLES
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 GEMINI_API_KEY = os.environ.get("VEO3_API_KEY") or os.environ.get("GEMINI_API_KEY")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY or not GEMINI_API_KEY:
-    raise Exception("Missing required environment variables")
+    raise Exception("Missing environment variables")
 
-# INIT CLIENT
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 app = FastAPI()
@@ -69,19 +67,15 @@ def upload_video_to_supabase(generation_id, video_bytes):
     if res.status_code >= 300:
         raise Exception(res.text)
 
-    public_url = f"{SUPABASE_URL}/storage/v1/object/public/creative-media/video-final/{generation_id}.mp4"
-
-    return public_url
+    return f"{SUPABASE_URL}/storage/v1/object/public/creative-media/video-final/{generation_id}.mp4"
 
 
 def download_image_as_base64(image_url):
 
-    print("Downloading image...")
-
     res = requests.get(image_url)
 
     if res.status_code != 200:
-        raise Exception("Failed to download image")
+        raise Exception("Image download failed")
 
     mime = res.headers.get("Content-Type", "image/jpeg")
 
@@ -101,25 +95,26 @@ def generate_video(req: GenerateVideoRequest):
 
         update_generation(generation_id, "processing")
 
-        # DOWNLOAD IMAGE
         image_base64, mime_type = download_image_as_base64(req.image_url)
 
-        # GENERATE VIDEO
         print("Calling Veo 3.1...")
 
         operation = genai_client.models.generate_videos(
             model="veo-3.1-generate-preview",
+
             prompt=req.prompt,
-            image={
-                "bytesBase64Encoded": image_base64,
-                "mimeType": mime_type
-            },
+
+            image=types.Image(
+                bytes_base64_encoded=image_base64,
+                mime_type=mime_type
+            ),
+
             config=types.GenerateVideosConfig(
                 aspect_ratio=req.aspect_ratio
             ),
         )
 
-        print("Polling operation...")
+        print("Polling...")
 
         while not operation.done:
 
@@ -127,35 +122,31 @@ def generate_video(req: GenerateVideoRequest):
 
             operation = genai_client.operations.get(operation)
 
-            print("Still processing...")
+            print("Still processing")
 
-        if not operation.response or not operation.response.generated_videos:
+        if not operation.response.generated_videos:
             raise Exception("No video returned")
 
         video_uri = operation.response.generated_videos[0].video.uri
 
-        print("Downloading video from Gemini...")
-
         video_bytes = genai_client.files.download(video_uri)
-
-        print("Uploading to Supabase...")
 
         final_url = upload_video_to_supabase(
             generation_id,
-            video_bytes,
+            video_bytes
         )
-
-        print("Completed:", final_url)
 
         update_generation(
             generation_id,
             "completed",
-            final_url,
+            final_url
         )
+
+        print("Completed:", final_url)
 
         return {
             "status": "completed",
-            "video_url": final_url,
+            "video_url": final_url
         }
 
     except Exception as e:
@@ -166,5 +157,5 @@ def generate_video(req: GenerateVideoRequest):
 
         raise HTTPException(
             status_code=500,
-            detail=str(e),
+            detail=str(e)
         )
