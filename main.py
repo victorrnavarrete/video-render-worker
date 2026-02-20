@@ -1,25 +1,25 @@
 import os
 import time
+import tempfile
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from google import genai
+from google.genai import types
+
+# ENV
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("VEO3_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-if not SUPABASE_URL:
-    raise Exception("SUPABASE_URL not set")
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY or not GEMINI_API_KEY:
+    raise Exception("Missing required environment variables")
 
-if not SUPABASE_SERVICE_ROLE_KEY:
-    raise Exception("SUPABASE_SERVICE_ROLE_KEY not set")
-
-if not GEMINI_API_KEY:
-    raise Exception("GEMINI_API_KEY or VEO3_API_KEY not set")
+# INIT CLIENT
+genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 app = FastAPI()
-
-MODEL_NAME = "veo-3.0-fast-generate-preview"
 
 
 class GenerateVideoRequest(BaseModel):
@@ -31,11 +31,17 @@ class GenerateVideoRequest(BaseModel):
     duration: int
 
 
+# -------------------------
+# Supabase helpers
+# -------------------------
+
 def update_generation(generation_id, status, final_video_url=None):
 
     url = f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{generation_id}"
 
-    payload = {"status": status}
+    payload = {
+        "status": status
+    }
 
     if final_video_url:
         payload["final_video_url"] = final_video_url
@@ -50,87 +56,105 @@ def update_generation(generation_id, status, final_video_url=None):
     res = requests.patch(url, json=payload, headers=headers)
 
     if res.status_code >= 300:
-        print("Supabase update error:", res.text)
+        print("Supabase update failed:", res.text)
 
+
+def upload_to_supabase(generation_id, file_path):
+
+    storage_path = f"video-final/{generation_id}.mp4"
+
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/creative-media/{storage_path}"
+
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "video/mp4"
+    }
+
+    with open(file_path, "rb") as f:
+        res = requests.post(upload_url, headers=headers, data=f)
+
+    if res.status_code not in [200, 201]:
+        raise Exception(f"Supabase upload failed: {res.text}")
+
+    public_url = f"{SUPABASE_URL}/storage/v1/object/public/creative-media/{storage_path}"
+
+    return public_url
+
+
+# -------------------------
+# Veo generation endpoint
+# -------------------------
 
 @app.post("/generate-video")
 def generate_video(req: GenerateVideoRequest):
 
+    generation_id = req.generation_id
+
     try:
 
-        generation_id = req.generation_id
-
-        print("Starting Veo3 generation:", generation_id)
+        print("Starting Veo 3.1 generation:", generation_id)
 
         update_generation(generation_id, "processing")
 
-        prompt = f"""
-{req.prompt}
+        # Download image locally
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_image:
 
-The person speaks the following script in Brazilian Portuguese:
+            img_res = requests.get(req.image_url)
 
-"{req.script_text}"
+            if img_res.status_code != 200:
+                raise Exception("Failed to download image")
 
-The avatar lip-sync must match speech exactly.
-Photorealistic human motion.
-Natural facial muscle movement.
-Cinematic lighting.
-"""
+            tmp_image.write(img_res.content)
 
-        create_url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateVideo?key={GEMINI_API_KEY}"
+            image_path = tmp_image.name
 
-        create_payload = {
-            "prompt": prompt,
-            "config": {
-                "aspectRatio": req.aspect_ratio,
-                "durationSeconds": req.duration
-            }
+        print("Uploading image to Gemini Files API...")
+
+        uploaded_file = genai_client.files.upload(file=image_path)
+
+        print("Generating video via Veo 3.1...")
+
+        operation = genai_client.models.generate_videos(
+            model="veo-3.1-generate-preview",
+            prompt=[uploaded_file, req.prompt],
+            config=types.GenerateVideosConfig(
+                aspect_ratio=req.aspect_ratio
+            )
+        )
+
+        print("Waiting for generation...")
+
+        while not operation.done:
+            time.sleep(10)
+            operation = genai_client.operations.get(operation.name)
+
+        if not operation.response.generated_videos:
+            raise Exception("No video generated")
+
+        generated_video = operation.response.generated_videos[0]
+
+        # Download video locally
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_video:
+
+            genai_client.files.download(
+                file=generated_video.video,
+                path=tmp_video.name
+            )
+
+            video_path = tmp_video.name
+
+        print("Uploading video to Supabase...")
+
+        final_url = upload_to_supabase(generation_id, video_path)
+
+        update_generation(generation_id, "completed", final_url)
+
+        print("Completed:", final_url)
+
+        return {
+            "status": "completed",
+            "video_url": final_url
         }
-
-        create_res = requests.post(create_url, json=create_payload)
-
-        if create_res.status_code >= 300:
-            raise Exception(create_res.text)
-
-        operation = create_res.json()
-
-        operation_name = operation["name"]
-
-        print("Operation:", operation_name)
-
-        poll_url = f"https://generativelanguage.googleapis.com/v1beta/{operation_name}?key={GEMINI_API_KEY}"
-
-        while True:
-
-            poll_res = requests.get(poll_url)
-
-            if poll_res.status_code >= 300:
-                raise Exception(poll_res.text)
-
-            poll = poll_res.json()
-
-            if poll.get("done"):
-
-                if "error" in poll:
-                    raise Exception(poll["error"])
-
-                video_uri = poll["response"]["video"]["uri"]
-
-                print("Video ready:", video_uri)
-
-                update_generation(
-                    generation_id,
-                    "completed",
-                    video_uri
-                )
-
-                return {
-                    "status": "completed",
-                    "video_url": video_uri
-                }
-
-            print("Still processing Veo3...")
-            time.sleep(5)
 
     except Exception as e:
 
