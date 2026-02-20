@@ -3,31 +3,35 @@ import time
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from google import genai
-from google.genai import types
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+from google import genai
+
+# ENV VARS
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("VEO3_API_KEY")
 
-if not SUPABASE_URL.startswith("http"):
-    raise Exception("SUPABASE_URL must start with https://")
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY or not GEMINI_API_KEY:
+    raise Exception("Missing required environment variables")
 
+# Init Gemini client
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 app = FastAPI()
 
+
+# Request model
 class GenerateVideoRequest(BaseModel):
     generation_id: str
     image_url: str
-    script_text: str
+    script_text: str | None = ""
     prompt: str
-    aspect_ratio: str
-    duration: int
+    aspect_ratio: str = "9:16"
+    duration: int = 5
 
 
+# Supabase updater
 def update_generation(generation_id, status, final_video_url=None):
-
     url = f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{generation_id}"
 
     payload = {"status": status}
@@ -48,9 +52,14 @@ def update_generation(generation_id, status, final_video_url=None):
         raise Exception(f"Supabase update failed: {res.text}")
 
 
-@app.get("/")
-def health():
-    return {"status": "ok"}
+# Download helper
+def download_file(url):
+    res = requests.get(url, timeout=60)
+
+    if res.status_code != 200:
+        raise Exception("Failed to download image")
+
+    return res.content
 
 
 @app.post("/generate-video")
@@ -60,93 +69,106 @@ def generate_video(req: GenerateVideoRequest):
 
     try:
 
-        print("Starting Veo 3.1 generation:", generation_id)
+        print(f"Starting Veo 3.1 generation: {generation_id}")
 
         update_generation(generation_id, "processing")
 
-        # STEP 1: download image
+        # Step 1: download image locally
         print("Downloading image...")
-        image_response = requests.get(req.image_url)
+        image_bytes = download_file(req.image_url)
 
-        if image_response.status_code != 200:
-            raise Exception("Failed to download image")
+        local_path = f"/tmp/{generation_id}.jpg"
 
-        image_bytes = image_response.content
+        with open(local_path, "wb") as f:
+            f.write(image_bytes)
 
-        # STEP 2: upload to Gemini Files API
+        # Step 2: upload to Gemini Files API (CORRECT API USAGE)
         print("Uploading image to Gemini Files API...")
 
         uploaded_file = client.files.upload(
-            file=image_bytes,
-            mime_type="image/jpeg"
+            file=local_path
         )
 
-        # STEP 3: build prompt string ONLY
-        final_prompt = f"{req.prompt}\n\nSpeech:\n{req.script_text}"
-
+        # Step 3: generate video
         print("Generating video via Veo 3.1...")
+
+        full_prompt = req.prompt
+
+        if req.script_text:
+            full_prompt += f"\n\nCharacter speaking naturally in Brazilian Portuguese:\n{req.script_text}"
 
         operation = client.models.generate_videos(
             model="veo-3.1-generate-preview",
-            prompt=final_prompt,
+            prompt=full_prompt,
             image=uploaded_file,
-            config=types.GenerateVideosConfig(
-                aspect_ratio=req.aspect_ratio
-            )
+            aspect_ratio=req.aspect_ratio
         )
 
-        # STEP 4: poll operation
+        # Step 4: poll operation
+        print("Waiting Veo 3.1...")
+
         while not operation.done:
-
-            print("Waiting Veo 3.1...")
             time.sleep(10)
-
             operation = client.operations.get(operation)
 
-        if not operation.response.generated_videos:
+        if not operation.response or not operation.response.generated_videos:
             raise Exception("No video generated")
 
         video_file = operation.response.generated_videos[0].video
 
-        # STEP 5: download video
-        local_path = f"/tmp/{generation_id}.mp4"
+        output_path = f"/tmp/{generation_id}.mp4"
 
         client.files.download(
             file=video_file,
-            path=local_path
+            path=output_path
         )
 
-        # STEP 6: upload to Supabase Storage
-        print("Uploading final video to Supabase...")
+        print("Video downloaded")
+
+        # Step 5: upload to Supabase Storage
+        print("Uploading to Supabase Storage...")
 
         storage_url = f"{SUPABASE_URL}/storage/v1/object/creative-media/video-final/{generation_id}.mp4"
 
-        with open(local_path, "rb") as f:
+        headers = {
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Content-Type": "video/mp4",
+            "x-upsert": "true"
+        }
 
-            upload = requests.post(
+        with open(output_path, "rb") as f:
+            upload_res = requests.post(
                 storage_url,
-                headers={
-                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                    "Content-Type": "video/mp4"
-                },
+                headers=headers,
                 data=f
             )
 
-        if upload.status_code not in [200, 201]:
-            raise Exception(upload.text)
+        if upload_res.status_code >= 300:
+            raise Exception(f"Upload failed: {upload_res.text}")
 
         public_url = f"{SUPABASE_URL}/storage/v1/object/public/creative-media/video-final/{generation_id}.mp4"
 
-        update_generation(generation_id, "completed", public_url)
+        update_generation(
+            generation_id,
+            "completed",
+            public_url
+        )
 
-        print("SUCCESS:", public_url)
+        print(f"SUCCESS: {public_url}")
 
-        return {"video_url": public_url}
+        return {
+            "status": "completed",
+            "video_url": public_url
+        }
 
     except Exception as e:
 
         print("ERROR:", str(e))
 
-        update_generation(generation_id, "failed")
+        try:
+            update_generation(generation_id, "failed")
+        except:
+            pass
 
         raise HTTPException(status_code=500, detail=str(e))
