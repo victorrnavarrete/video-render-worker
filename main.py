@@ -1,6 +1,5 @@
 import os
 import time
-import base64
 import requests
 
 from fastapi import FastAPI, HTTPException
@@ -46,10 +45,7 @@ def update_generation(generation_id, status, final_video_url=None):
         "Prefer": "return=minimal",
     }
 
-    res = requests.patch(url, json=payload, headers=headers)
-
-    if res.status_code >= 300:
-        print("Supabase update error:", res.text)
+    requests.patch(url, json=payload, headers=headers)
 
 
 def upload_video_to_supabase(generation_id, video_bytes):
@@ -70,7 +66,7 @@ def upload_video_to_supabase(generation_id, video_bytes):
     return f"{SUPABASE_URL}/storage/v1/object/public/creative-media/video-final/{generation_id}.mp4"
 
 
-def download_image_as_base64(image_url):
+def download_image_as_bytes(image_url):
 
     res = requests.get(image_url)
 
@@ -79,9 +75,7 @@ def download_image_as_base64(image_url):
 
     mime = res.headers.get("Content-Type", "image/jpeg")
 
-    base64_bytes = base64.b64encode(res.content).decode("utf-8")
-
-    return base64_bytes, mime
+    return res.content, mime
 
 
 @app.post("/generate-video")
@@ -95,9 +89,7 @@ def generate_video(req: GenerateVideoRequest):
 
         update_generation(generation_id, "processing")
 
-        image_base64, mime_type = download_image_as_base64(req.image_url)
-
-        print("Calling Veo 3.1...")
+        image_bytes, mime_type = download_image_as_bytes(req.image_url)
 
         operation = genai_client.models.generate_videos(
             model="veo-3.1-generate-preview",
@@ -105,7 +97,7 @@ def generate_video(req: GenerateVideoRequest):
             prompt=req.prompt,
 
             image=types.Image(
-                bytes_base64_encoded=image_base64,
+                data=image_bytes,
                 mime_type=mime_type
             ),
 
@@ -114,7 +106,7 @@ def generate_video(req: GenerateVideoRequest):
             ),
         )
 
-        print("Polling...")
+        print("Polling Veo...")
 
         while not operation.done:
 
@@ -123,9 +115,6 @@ def generate_video(req: GenerateVideoRequest):
             operation = genai_client.operations.get(operation)
 
             print("Still processing")
-
-        if not operation.response.generated_videos:
-            raise Exception("No video returned")
 
         video_uri = operation.response.generated_videos[0].video.uri
 
