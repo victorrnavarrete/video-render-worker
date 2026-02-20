@@ -13,9 +13,9 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 GEMINI_API_KEY = os.environ.get("VEO3_API_KEY") or os.environ.get("GEMINI_API_KEY")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY or not GEMINI_API_KEY:
-    raise Exception("Missing environment variables")
+    raise Exception("Missing SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, or GEMINI_API_KEY")
 
-genai_client = genai.Client(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 app = FastAPI()
 
@@ -50,7 +50,9 @@ def update_generation(generation_id, status, final_video_url=None):
 
 def upload_video_to_supabase(generation_id, video_bytes):
 
-    storage_url = f"{SUPABASE_URL}/storage/v1/object/creative-media/video-final/{generation_id}.mp4"
+    storage_path = f"video-final/{generation_id}.mp4"
+
+    url = f"{SUPABASE_URL}/storage/v1/object/creative-media/{storage_path}"
 
     headers = {
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -58,24 +60,27 @@ def upload_video_to_supabase(generation_id, video_bytes):
         "x-upsert": "true",
     }
 
-    res = requests.post(storage_url, headers=headers, data=video_bytes)
+    res = requests.post(url, headers=headers, data=video_bytes)
 
     if res.status_code >= 300:
         raise Exception(res.text)
 
-    return f"{SUPABASE_URL}/storage/v1/object/public/creative-media/video-final/{generation_id}.mp4"
+    return f"{SUPABASE_URL}/storage/v1/object/public/creative-media/{storage_path}"
 
 
-def download_image_as_bytes(image_url):
+def download_image(image_url):
 
     res = requests.get(image_url)
 
     if res.status_code != 200:
-        raise Exception("Image download failed")
+        raise Exception("Failed to download image")
 
-    mime = res.headers.get("Content-Type", "image/jpeg")
+    temp_path = "/tmp/input_image.jpg"
 
-    return res.content, mime
+    with open(temp_path, "wb") as f:
+        f.write(res.content)
+
+    return temp_path
 
 
 @app.post("/generate-video")
@@ -89,36 +94,40 @@ def generate_video(req: GenerateVideoRequest):
 
         update_generation(generation_id, "processing")
 
-        image_bytes, mime_type = download_image_as_bytes(req.image_url)
+        # download image locally
+        image_path = download_image(req.image_url)
 
-        operation = genai_client.models.generate_videos(
+        print("Uploading image to Gemini Files API...")
+
+        uploaded_file = client.files.upload(file=image_path)
+
+        print("Generating video via Veo 3.1...")
+
+        operation = client.models.generate_videos(
             model="veo-3.1-generate-preview",
-
-            prompt=req.prompt,
-
-            image=types.Image(
-                data=image_bytes,
-                mime_type=mime_type
-            ),
-
+            prompt=[uploaded_file, req.prompt],
             config=types.GenerateVideosConfig(
                 aspect_ratio=req.aspect_ratio
             ),
         )
 
-        print("Polling Veo...")
+        print("Polling Veo operation...")
 
         while not operation.done:
 
             time.sleep(10)
 
-            operation = genai_client.operations.get(operation)
+            operation = client.operations.get(operation)
 
-            print("Still processing")
+            print("Still processing...")
 
-        video_uri = operation.response.generated_videos[0].video.uri
+        video_file = operation.response.generated_videos[0].video
 
-        video_bytes = genai_client.files.download(video_uri)
+        print("Downloading video...")
+
+        video_bytes = client.files.download(video_file)
+
+        print("Uploading to Supabase...")
 
         final_url = upload_video_to_supabase(
             generation_id,
