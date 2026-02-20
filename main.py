@@ -1,6 +1,5 @@
 import os
 import time
-import base64
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -8,12 +7,14 @@ from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("VEO3_API_KEY")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY or not GEMINI_API_KEY:
     raise Exception("Missing required environment variables")
+
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -90,7 +91,7 @@ def generate_video(req: GenerateVideoRequest):
 
         print("Creating Veo Image object...")
 
-        veo_image = types.Image.from_bytes(
+        veo_image = types.Image(
             data=image_bytes,
             mime_type=mime_type
         )
@@ -111,7 +112,7 @@ def generate_video(req: GenerateVideoRequest):
             )
         )
 
-        print("Waiting for Veo completion...")
+        print("Waiting for completion...")
 
         while not operation.done:
             time.sleep(10)
@@ -129,7 +130,7 @@ def generate_video(req: GenerateVideoRequest):
             path=local_path
         )
 
-        print("Uploading video to Supabase Storage...")
+        print("Uploading to Supabase...")
 
         storage_url = f"{SUPABASE_URL}/storage/v1/object/creative-media/video-final/{generation_id}.mp4"
 
