@@ -2,5 +2,4 @@ fastapi
 uvicorn
 requests
 python-multipart
-google-genai>=0.3.0
 google-genai==0.3.2
