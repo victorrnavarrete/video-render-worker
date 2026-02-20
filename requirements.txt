@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-moviepy
 requests
-python-multipart
+google-genai
 
