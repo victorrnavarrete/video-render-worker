@@ -62,17 +62,6 @@ def download_image_bytes(url):
     return res.content
 
 
-def detect_mime(image_bytes):
-
-    if image_bytes[:3] == b"\xff\xd8\xff":
-        return "image/jpeg"
-
-    if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
-        return "image/png"
-
-    return "image/jpeg"
-
-
 @app.post("/generate-video")
 def generate_video(req: GenerateVideoRequest):
 
@@ -87,14 +76,9 @@ def generate_video(req: GenerateVideoRequest):
         print("Downloading image...")
         image_bytes = download_image_bytes(req.image_url)
 
-        mime_type = detect_mime(image_bytes)
-
         print("Creating Veo Image object...")
 
-        veo_image = types.Image(
-            data=image_bytes,
-            mime_type=mime_type
-        )
+        veo_image = types.Image.from_bytes(image_bytes)
 
         full_prompt = req.prompt
 
