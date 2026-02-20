@@ -4,31 +4,50 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+# =============================
+# ENV VARIABLES
+# =============================
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-GEMINI_API_KEY = os.environ.get("VEO3_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    raise Exception("Missing Supabase environment variables")
+
+if not GEMINI_API_KEY:
+    raise Exception("Missing GEMINI_API_KEY")
+
+# =============================
+# APP INIT
+# =============================
 
 app = FastAPI()
 
+# =============================
+# REQUEST MODEL
+# =============================
 
 class GenerateVideoRequest(BaseModel):
     generation_id: str
     image_url: str
-    script_text: str
+    script_text: str | None = None
     prompt: str
     aspect_ratio: str
     duration: int
 
 
-# ========================
-# Update Supabase
-# ========================
+# =============================
+# SUPABASE UPDATE
+# =============================
 
 def update_generation(generation_id, status, final_video_url=None):
 
     url = f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{generation_id}"
 
-    payload = {"status": status}
+    payload = {
+        "status": status
+    }
 
     if final_video_url:
         payload["final_video_url"] = final_video_url
@@ -40,167 +59,175 @@ def update_generation(generation_id, status, final_video_url=None):
         "Prefer": "return=minimal"
     }
 
-    requests.patch(url, json=payload, headers=headers)
+    res = requests.patch(url, json=payload, headers=headers)
+
+    if res.status_code >= 300:
+        print("Supabase update error:", res.text)
 
 
-# ========================
-# Upload image to Gemini Files API
-# ========================
+# =============================
+# GEMINI FILE UPLOAD
+# =============================
 
 def upload_image_to_gemini(image_url):
 
-    print("Downloading source image")
+    print("Downloading source image...")
 
-    image = requests.get(image_url)
+    img = requests.get(image_url)
 
-    if image.status_code != 200:
+    if img.status_code != 200:
         raise Exception("Failed to download image")
 
-    print("Uploading to Gemini Files API")
-
-    upload_url = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+    upload_url = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={GEMINI_API_KEY}"
 
     headers = {
-        "x-goog-api-key": GEMINI_API_KEY
+        "X-Goog-Upload-Protocol": "raw",
+        "X-Goog-Upload-File-Name": "source.jpg",
+        "Content-Type": "image/jpeg"
     }
 
-    files = {
-        "file": ("image.jpg", image.content, "image/jpeg")
-    }
+    print("Uploading image to Gemini Files API...")
 
-    res = requests.post(upload_url, headers=headers, files=files)
+    res = requests.post(upload_url, headers=headers, data=img.content)
 
     if res.status_code != 200:
-        raise Exception(res.text)
+        raise Exception(f"Gemini file upload failed: {res.text}")
 
     file_uri = res.json()["file"]["uri"]
 
-    print("Uploaded file_uri:", file_uri)
+    print("Gemini file uri:", file_uri)
 
     return file_uri
 
 
-# ========================
-# Generate video
-# ========================
+# =============================
+# START VEO JOB
+# =============================
+
+def start_veo_job(file_uri, prompt, aspect_ratio, duration):
+
+    veo_url = f"https://generativelanguage.googleapis.com/v1beta/models/veo-3.0-fast-image-to-video-preview:predictLongRunning?key={GEMINI_API_KEY}"
+
+    payload = {
+        "instances": [
+            {
+                "image": {
+                    "gcsUri": file_uri
+                },
+                "prompt": prompt
+            }
+        ],
+        "parameters": {
+            "aspectRatio": aspect_ratio,
+            "durationSeconds": duration
+        }
+    }
+
+    print("Starting Veo job...")
+
+    res = requests.post(veo_url, json=payload)
+
+    if res.status_code != 200:
+        raise Exception(res.text)
+
+    operation = res.json()["name"]
+
+    print("Operation:", operation)
+
+    return operation
+
+
+# =============================
+# POLL VEO JOB
+# =============================
+
+def poll_veo(operation):
+
+    poll_url = f"https://generativelanguage.googleapis.com/v1beta/{operation}?key={GEMINI_API_KEY}"
+
+    print("Polling Veo...")
+
+    while True:
+
+        res = requests.get(poll_url)
+
+        if res.status_code != 200:
+            raise Exception(res.text)
+
+        data = res.json()
+
+        if data.get("done"):
+
+            video_url = data["response"]["video"]["uri"]
+
+            print("Video ready:", video_url)
+
+            return video_url
+
+        print("Still processing...")
+
+        time.sleep(5)
+
+
+# =============================
+# MAIN ENDPOINT
+# =============================
 
 @app.post("/generate-video")
 def generate_video(req: GenerateVideoRequest):
 
+    generation_id = req.generation_id
+
     try:
 
-        print("Starting generation:", req.generation_id)
+        print("Starting generation:", generation_id)
 
-        update_generation(req.generation_id, "processing")
+        update_generation(generation_id, "processing")
 
+        # combine prompt + speech naturally
+        full_prompt = req.prompt
+
+        if req.script_text:
+            full_prompt += f"\n\nCharacter speaks naturally in Brazilian Portuguese:\n{req.script_text}"
+
+        # upload image
         file_uri = upload_image_to_gemini(req.image_url)
 
-        endpoint = (
-            "https://generativelanguage.googleapis.com/v1beta/"
-            "models/veo-3.1-generate-preview:predictLongRunning"
+        # start veo job
+        operation = start_veo_job(
+            file_uri=file_uri,
+            prompt=full_prompt,
+            aspect_ratio=req.aspect_ratio,
+            duration=req.duration
         )
 
-        headers = {
-            "x-goog-api-key": GEMINI_API_KEY,
-            "Content-Type": "application/json"
+        # poll result
+        video_url = poll_veo(operation)
+
+        update_generation(
+            generation_id,
+            "completed",
+            video_url
+        )
+
+        return {
+            "status": "completed",
+            "video_url": video_url
         }
-
-        full_prompt = f"""
-{req.prompt}
-
-Script (Brazilian Portuguese):
-{req.script_text}
-
-Requirements:
-perfect lip sync
-photorealistic
-cinematic
-natural speech timing
-"""
-
-        payload = {
-
-            "instances": [
-
-                {
-                    "prompt": full_prompt,
-
-                    "image": {
-
-                        "fileData": {
-
-                            "mimeType": "image/jpeg",
-                            "fileUri": file_uri
-
-                        }
-                    }
-                }
-            ],
-
-            "parameters": {
-
-                "aspectRatio": req.aspect_ratio,
-                "durationSeconds": req.duration
-
-            }
-        }
-
-        print("Submitting Veo3 job")
-
-        response = requests.post(endpoint, json=payload, headers=headers)
-
-        if response.status_code != 200:
-            raise Exception(response.text)
-
-        operation = response.json()["name"]
-
-        print("Operation:", operation)
-
-        poll_url = f"https://generativelanguage.googleapis.com/v1beta/{operation}"
-
-        while True:
-
-            poll = requests.get(poll_url, headers=headers)
-
-            if poll.status_code != 200:
-                raise Exception(poll.text)
-
-            data = poll.json()
-
-            if data.get("done"):
-
-                video_uri = (
-                    data["response"]["candidates"][0]
-                    ["content"]["parts"][0]
-                    ["fileData"]["uri"]
-                )
-
-                print("Video ready:", video_uri)
-
-                update_generation(
-                    req.generation_id,
-                    "completed",
-                    video_uri
-                )
-
-                return {
-
-                    "status": "completed",
-                    "video_url": video_uri
-
-                }
-
-            print("Still processing")
-
-            time.sleep(10)
 
     except Exception as e:
 
         print("ERROR:", str(e))
 
-        update_generation(req.generation_id, "failed")
+        update_generation(generation_id, "failed")
 
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================
+# HEALTH CHECK
+# =============================
+
+@app.get("/")
+def health():
+    return {"status": "ok"}
