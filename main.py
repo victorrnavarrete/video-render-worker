@@ -115,12 +115,13 @@ def generate_video(req: GenerateVideoRequest):
         print("Generating video via Veo 3.1...")
 
         operation = genai_client.models.generate_videos(
-            model="veo-3.1-generate-preview",
-            prompt=[uploaded_file, req.prompt],
-            config=types.GenerateVideosConfig(
-                aspect_ratio=req.aspect_ratio
-            )
-        )
+    model="veo-3.1-generate-preview",
+    prompt=req.prompt,
+    image=uploaded_file,
+    config=types.GenerateVideosConfig(
+        aspect_ratio=req.aspect_ratio
+    )
+)
 
         print("Waiting for generation...")
 
