@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from google import genai
+from google.genai import types
 
 # ENV VARS
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -20,7 +21,6 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 app = FastAPI()
 
 
-# Request model
 class GenerateVideoRequest(BaseModel):
     generation_id: str
     image_url: str
@@ -30,8 +30,8 @@ class GenerateVideoRequest(BaseModel):
     duration: int = 5
 
 
-# Supabase updater
 def update_generation(generation_id, status, final_video_url=None):
+
     url = f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{generation_id}"
 
     payload = {"status": status}
@@ -49,11 +49,11 @@ def update_generation(generation_id, status, final_video_url=None):
     res = requests.patch(url, json=payload, headers=headers)
 
     if res.status_code >= 300:
-        raise Exception(f"Supabase update failed: {res.text}")
+        raise Exception(res.text)
 
 
-# Download helper
 def download_file(url):
+
     res = requests.get(url, timeout=60)
 
     if res.status_code != 200:
@@ -73,7 +73,7 @@ def generate_video(req: GenerateVideoRequest):
 
         update_generation(generation_id, "processing")
 
-        # Step 1: download image locally
+        # download image
         print("Downloading image...")
         image_bytes = download_file(req.image_url)
 
@@ -82,31 +82,30 @@ def generate_video(req: GenerateVideoRequest):
         with open(local_path, "wb") as f:
             f.write(image_bytes)
 
-        # Step 2: upload to Gemini Files API (CORRECT API USAGE)
+        # upload to Gemini Files API
         print("Uploading image to Gemini Files API...")
+        uploaded_file = client.files.upload(file=local_path)
 
-        uploaded_file = client.files.upload(
-            file=local_path
-        )
-
-        # Step 3: generate video
-        print("Generating video via Veo 3.1...")
-
+        # build prompt
         full_prompt = req.prompt
 
         if req.script_text:
             full_prompt += f"\n\nCharacter speaking naturally in Brazilian Portuguese:\n{req.script_text}"
 
+        # generate video (CORRECT CONFIG STRUCTURE)
+        print("Generating video via Veo 3.1...")
+
         operation = client.models.generate_videos(
             model="veo-3.1-generate-preview",
             prompt=full_prompt,
             image=uploaded_file,
-            aspect_ratio=req.aspect_ratio
+            config=types.GenerateVideosConfig(
+                aspect_ratio=req.aspect_ratio
+            )
         )
 
-        # Step 4: poll operation
-        print("Waiting Veo 3.1...")
-
+        # poll operation
+        print("Waiting for Veo...")
         while not operation.done:
             time.sleep(10)
             operation = client.operations.get(operation)
@@ -123,9 +122,7 @@ def generate_video(req: GenerateVideoRequest):
             path=output_path
         )
 
-        print("Video downloaded")
-
-        # Step 5: upload to Supabase Storage
+        # upload to Supabase Storage
         print("Uploading to Supabase Storage...")
 
         storage_url = f"{SUPABASE_URL}/storage/v1/object/creative-media/video-final/{generation_id}.mp4"
@@ -138,6 +135,7 @@ def generate_video(req: GenerateVideoRequest):
         }
 
         with open(output_path, "rb") as f:
+
             upload_res = requests.post(
                 storage_url,
                 headers=headers,
@@ -145,7 +143,7 @@ def generate_video(req: GenerateVideoRequest):
             )
 
         if upload_res.status_code >= 300:
-            raise Exception(f"Upload failed: {upload_res.text}")
+            raise Exception(upload_res.text)
 
         public_url = f"{SUPABASE_URL}/storage/v1/object/public/creative-media/video-final/{generation_id}.mp4"
 
