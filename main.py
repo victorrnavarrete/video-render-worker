@@ -1,23 +1,42 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import os
 import requests
 import time
-import os
-import uuid
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+VEO3_API_KEY = os.environ.get("VEO3_API_KEY")
 
 app = FastAPI()
-
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-VEO3_API_KEY = os.environ["VEO3_API_KEY"]
 
 class GenerateVideoRequest(BaseModel):
     generation_id: str
     image_url: str
-    script_text: str | None = None
+    script_text: str
     prompt: str
-    aspect_ratio: str = "9:16"
-    duration: int = 8
+    aspect_ratio: str
+    duration: int
+
+
+def update_generation_status(generation_id, status, final_video_url=None):
+    url = f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{generation_id}"
+
+    payload = {
+        "status": status
+    }
+
+    if final_video_url:
+        payload["final_video_url"] = final_video_url
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
+    }
+
+    requests.patch(url, json=payload, headers=headers)
 
 
 @app.post("/generate-video")
@@ -25,103 +44,76 @@ def generate_video(req: GenerateVideoRequest):
 
     try:
 
-        print("Starting Veo3 generation...")
+        generation_id = req.generation_id
 
-        # STEP 1 — Submit Veo3 job
-        submit = requests.post(
-            "https://api.veo3.ai/v1/video/generate",
-            headers={
-                "Authorization": f"Bearer {VEO3_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "image_url": req.image_url,
-                "prompt": req.prompt,
-                "script": req.script_text,
-                "aspect_ratio": req.aspect_ratio,
-                "duration": req.duration
-            }
-        )
+        print("Starting Veo3 generation:", generation_id)
 
-        if submit.status_code != 200:
-            raise Exception(submit.text)
+        update_generation_status(generation_id, "processing")
 
-        job_id = submit.json()["job_id"]
+        # CALL VEO3 VIA FAL.AI
+        fal_url = "https://fal.run/fal-ai/google/veo3"
 
-        print(f"Veo3 job_id: {job_id}")
+        fal_headers = {
+            "Authorization": f"Key {os.environ.get('FAL_API_KEY')}",
+            "Content-Type": "application/json"
+        }
 
-        # STEP 2 — Poll Veo3
-        video_url = None
+        fal_payload = {
+            "prompt": f"{req.prompt}\n\nScript:\n{req.script_text}",
+            "image_url": req.image_url,
+            "aspect_ratio": req.aspect_ratio,
+            "duration": req.duration
+        }
 
-        for i in range(120):
+        res = requests.post(fal_url, json=fal_payload, headers=fal_headers)
 
-            poll = requests.get(
-                f"https://api.veo3.ai/v1/video/status/{job_id}",
-                headers={"Authorization": f"Bearer {VEO3_API_KEY}"}
-            )
+        if res.status_code != 200:
+            raise Exception(res.text)
 
+        job = res.json()
+
+        job_id = job.get("id")
+
+        if not job_id:
+            raise Exception("No Veo job id")
+
+        print("Veo job_id:", job_id)
+
+        # POLL RESULT
+        status_url = f"https://fal.run/fal-ai/google/veo3/{job_id}"
+
+        while True:
+
+            poll = requests.get(status_url, headers=fal_headers)
             data = poll.json()
 
-            print(f"Poll status: {data}")
+            if data.get("status") == "COMPLETED":
 
-            if data["status"] == "completed":
-                video_url = data["video_url"]
-                break
+                video_url = data["video"]["url"]
 
+                print("Video ready:", video_url)
+
+                update_generation_status(
+                    generation_id,
+                    "completed",
+                    video_url
+                )
+
+                return {
+                    "status": "completed",
+                    "video_url": video_url
+                }
+
+            if data.get("status") == "FAILED":
+                raise Exception("Veo failed")
+
+            print("Still processing...")
             time.sleep(5)
-
-        if not video_url:
-            raise Exception("Timeout waiting Veo3")
-
-        print(f"Video ready: {video_url}")
-
-        # STEP 3 — Download video
-        video_bytes = requests.get(video_url).content
-
-        filename = f"{req.generation_id}.mp4"
-
-        # STEP 4 — Upload to Supabase Storage
-        upload = requests.post(
-            f"{SUPABASE_URL}/storage/v1/object/video-final/{filename}",
-            headers={
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "Content-Type": "video/mp4"
-            },
-            data=video_bytes
-        )
-
-        public_url = f"{SUPABASE_URL}/storage/v1/object/public/video-final/{filename}"
-
-        print(f"Uploaded to Supabase: {public_url}")
-
-        # STEP 5 — Update DB
-        requests.patch(
-            f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{req.generation_id}",
-            headers={
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "Content-Type": "application/json",
-                "apikey": SUPABASE_SERVICE_ROLE_KEY
-            },
-            json={
-                "status": "completed",
-                "final_video_url": public_url
-            }
-        )
-
-        return {"status": "success", "video_url": public_url}
 
     except Exception as e:
 
-        print(f"ERROR: {e}")
+        print("ERROR:", str(e))
 
-        requests.patch(
-            f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{req.generation_id}",
-            headers={
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "Content-Type": "application/json",
-                "apikey": SUPABASE_SERVICE_ROLE_KEY
-            },
-            json={"status": "failed"}
-        )
+        update_generation_status(generation_id, "failed")
 
         raise HTTPException(status_code=500, detail=str(e))
