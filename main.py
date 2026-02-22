@@ -1,10 +1,13 @@
 import os
 import time
+import base64
 import requests
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from google import genai
+from google.genai import types
 
 # ========================
 # ENV
@@ -25,13 +28,14 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# ========================
-# FASTAPI
-# ========================
-
 app = FastAPI()
 
+# ========================
+# REQUEST MODEL
+# ========================
+
 class GenerateVideoRequest(BaseModel):
+
     generation_id: str
     image_url: str
     script_text: str
@@ -54,10 +58,12 @@ def update_generation(generation_id, status, final_video_url=None):
         payload["final_video_url"] = final_video_url
 
     headers = {
+
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
         "Content-Type": "application/json",
         "Prefer": "return=minimal"
+
     }
 
     requests.patch(url, json=payload, headers=headers)
@@ -89,18 +95,18 @@ def generate_video(req: GenerateVideoRequest):
         if img_res.status_code != 200:
             raise Exception("Image download failed")
 
-        local_image_path = f"/tmp/{generation_id}.jpg"
+        image_bytes = img_res.content
 
-        with open(local_image_path, "wb") as f:
-            f.write(img_res.content)
+        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
         # ========================
-        # UPLOAD IMAGE TO GEMINI FILE API
+        # BUILD IMAGE OBJECT (CORRECT FORMAT)
         # ========================
 
-        print("Uploading image to Gemini Files API...")
-
-        uploaded_file = client.files.upload(file=local_image_path)
+        veo_image = types.Image(
+            bytes_base64_encoded=image_base64,
+            mime_type="image/jpeg"
+        )
 
         # ========================
         # BUILD PROMPT STRING
@@ -112,7 +118,9 @@ def generate_video(req: GenerateVideoRequest):
 Speech:
 {req.script_text}
 
-Photorealistic talking avatar. Natural lip sync.
+Photorealistic talking avatar.
+Natural lip sync.
+Real human motion.
 """
 
         # ========================
@@ -122,15 +130,19 @@ Photorealistic talking avatar. Natural lip sync.
         print("Generating video via Veo 3.1...")
 
         operation = client.models.generate_videos(
+
             model="veo-3.1-generate-preview",
+
             prompt=full_prompt,
-            image=uploaded_file
+
+            image=veo_image
+
         )
 
         print("Operation started:", operation.name)
 
         # ========================
-        # POLL UNTIL COMPLETE
+        # POLL
         # ========================
 
         while not operation.done:
@@ -149,17 +161,19 @@ Photorealistic talking avatar. Natural lip sync.
         # DOWNLOAD VIDEO
         # ========================
 
-        local_video_path = f"/tmp/{generation_id}.mp4"
+        local_video = f"/tmp/{generation_id}.mp4"
 
         print("Downloading video...")
 
         client.files.download(
+
             file=video_file,
-            path=local_video_path
+            path=local_video
+
         )
 
         # ========================
-        # UPLOAD TO SUPABASE STORAGE
+        # UPLOAD SUPABASE
         # ========================
 
         print("Uploading to Supabase Storage...")
@@ -167,15 +181,19 @@ Photorealistic talking avatar. Natural lip sync.
         storage_url = f"{SUPABASE_URL}/storage/v1/object/creative-media/video-final/{generation_id}.mp4"
 
         headers = {
+
             "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
             "apikey": SUPABASE_SERVICE_ROLE_KEY,
             "Content-Type": "video/mp4"
+
         }
 
-        with open(local_video_path, "rb") as f:
+        with open(local_video, "rb") as f:
+
             upload_res = requests.post(storage_url, headers=headers, data=f)
 
         if upload_res.status_code >= 300:
+
             raise Exception(upload_res.text)
 
         public_url = f"{SUPABASE_URL}/storage/v1/object/public/creative-media/video-final/{generation_id}.mp4"
@@ -185,8 +203,10 @@ Photorealistic talking avatar. Natural lip sync.
         update_generation(generation_id, "completed", public_url)
 
         return {
+
             "status": "completed",
             "video_url": public_url
+
         }
 
     except Exception as e:
