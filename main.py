@@ -103,10 +103,10 @@ def generate_video(req: GenerateVideoRequest):
         # BUILD IMAGE OBJECT (CORRECT FORMAT)
         # ========================
 
-        veo_image = types.Image(
-            bytes_base64_encoded=image_base64,
-            mime_type="image/jpeg"
-        )
+        veo_image = types.Image.from_bytes(
+    image_bytes,
+    mime_type="image/jpeg"
+)
 
         # ========================
         # BUILD PROMPT STRING
