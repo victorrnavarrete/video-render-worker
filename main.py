@@ -5,25 +5,23 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from google import genai
-from google.genai import types
 
 # ========================
-# ENV VARIABLES
+# ENV
 # ========================
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("VEO3_API_KEY")
 
-if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    raise Exception("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set")
+if not SUPABASE_URL:
+    raise Exception("SUPABASE_URL missing")
+
+if not SUPABASE_SERVICE_ROLE_KEY:
+    raise Exception("SUPABASE_SERVICE_ROLE_KEY missing")
 
 if not GEMINI_API_KEY:
-    raise Exception("GEMINI_API_KEY or VEO3_API_KEY not set")
-
-# ========================
-# INIT CLIENT
-# ========================
+    raise Exception("GEMINI_API_KEY missing")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -40,6 +38,7 @@ class GenerateVideoRequest(BaseModel):
     prompt: str
     aspect_ratio: str
     duration: int
+
 
 # ========================
 # SUPABASE UPDATE
@@ -61,13 +60,11 @@ def update_generation(generation_id, status, final_video_url=None):
         "Prefer": "return=minimal"
     }
 
-    res = requests.patch(url, json=payload, headers=headers)
+    requests.patch(url, json=payload, headers=headers)
 
-    if res.status_code >= 300:
-        print("Supabase update error:", res.text)
 
 # ========================
-# MAIN ENDPOINT
+# GENERATE VIDEO
 # ========================
 
 @app.post("/generate-video")
@@ -77,7 +74,7 @@ def generate_video(req: GenerateVideoRequest):
 
     try:
 
-        print(f"Starting Veo 3.1 generation: {generation_id}")
+        print("Starting Veo 3.1 generation:", generation_id)
 
         update_generation(generation_id, "processing")
 
@@ -90,20 +87,23 @@ def generate_video(req: GenerateVideoRequest):
         img_res = requests.get(req.image_url)
 
         if img_res.status_code != 200:
-            raise Exception("Failed to download image")
+            raise Exception("Image download failed")
 
-        image_bytes = img_res.content
+        local_image_path = f"/tmp/{generation_id}.jpg"
 
-        # ========================
-        # CREATE IMAGE OBJECT (CORRECT METHOD)
-        # ========================
-
-        print("Creating Veo Image object...")
-
-        veo_image = types.Image(image_bytes=image_bytes)
+        with open(local_image_path, "wb") as f:
+            f.write(img_res.content)
 
         # ========================
-        # BUILD PROMPT
+        # UPLOAD IMAGE TO GEMINI FILE API
+        # ========================
+
+        print("Uploading image to Gemini Files API...")
+
+        uploaded_file = client.files.upload(file=local_image_path)
+
+        # ========================
+        # BUILD PROMPT STRING
         # ========================
 
         full_prompt = f"""
@@ -116,7 +116,7 @@ Photorealistic talking avatar. Natural lip sync.
 """
 
         # ========================
-        # START GENERATION
+        # CALL VEO 3.1
         # ========================
 
         print("Generating video via Veo 3.1...")
@@ -124,45 +124,45 @@ Photorealistic talking avatar. Natural lip sync.
         operation = client.models.generate_videos(
             model="veo-3.1-generate-preview",
             prompt=full_prompt,
-            image=veo_image
+            image=uploaded_file
         )
 
         print("Operation started:", operation.name)
 
         # ========================
-        # POLL
+        # POLL UNTIL COMPLETE
         # ========================
 
         while not operation.done:
 
-            print("Waiting for completion...")
+            print("Waiting...")
             time.sleep(10)
 
             operation = client.operations.get(operation.name)
 
-        # ========================
-        # GET RESULT
-        # ========================
-
-        if not operation.response or not operation.response.generated_videos:
+        if not operation.response.generated_videos:
             raise Exception("No video returned")
 
         video_file = operation.response.generated_videos[0].video
 
-        print("Downloading generated video...")
+        # ========================
+        # DOWNLOAD VIDEO
+        # ========================
 
-        video_path = f"/tmp/{generation_id}.mp4"
+        local_video_path = f"/tmp/{generation_id}.mp4"
+
+        print("Downloading video...")
 
         client.files.download(
             file=video_file,
-            path=video_path
+            path=local_video_path
         )
 
         # ========================
         # UPLOAD TO SUPABASE STORAGE
         # ========================
 
-        print("Uploading to Supabase storage...")
+        print("Uploading to Supabase Storage...")
 
         storage_url = f"{SUPABASE_URL}/storage/v1/object/creative-media/video-final/{generation_id}.mp4"
 
@@ -172,7 +172,7 @@ Photorealistic talking avatar. Natural lip sync.
             "Content-Type": "video/mp4"
         }
 
-        with open(video_path, "rb") as f:
+        with open(local_video_path, "rb") as f:
             upload_res = requests.post(storage_url, headers=headers, data=f)
 
         if upload_res.status_code >= 300:
@@ -180,7 +180,7 @@ Photorealistic talking avatar. Natural lip sync.
 
         public_url = f"{SUPABASE_URL}/storage/v1/object/public/creative-media/video-final/{generation_id}.mp4"
 
-        print("Video ready:", public_url)
+        print("SUCCESS:", public_url)
 
         update_generation(generation_id, "completed", public_url)
 
