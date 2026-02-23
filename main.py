@@ -1,18 +1,42 @@
 import os
 import time
-import base64
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
 from google import genai
 from google.genai import types
+
+# =====================================================
+# ENVIRONMENT VARIABLES
+# =====================================================
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-app = FastAPI()
+# Vertex AI auth via Service Account JSON
+# IMPORTANT: this must point to the JSON file path
+GOOGLE_APPLICATION_CREDENTIALS = os.environ.get(
+    "GOOGLE_APPLICATION_CREDENTIALS_JSON"
+)
 
-client = genai.Client()  # usa Vertex AI automaticamente quando GOOGLE_GENAI_USE_VERTEXAI=true
+if GOOGLE_APPLICATION_CREDENTIALS:
+    path = "/tmp/google_credentials.json"
+    with open(path, "w") as f:
+        f.write(GOOGLE_APPLICATION_CREDENTIALS)
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
+
+# Force Vertex AI mode
+os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
+
+# Create client
+client = genai.Client()
+
+# =====================================================
+# FASTAPI
+# =====================================================
+
+app = FastAPI()
 
 
 class GenerateVideoRequest(BaseModel):
@@ -24,11 +48,17 @@ class GenerateVideoRequest(BaseModel):
     duration: int
 
 
+# =====================================================
+# SUPABASE UPDATE
+# =====================================================
+
 def update_generation(generation_id, status, final_video_url=None):
 
     url = f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{generation_id}"
 
-    payload = {"status": status}
+    payload = {
+        "status": status
+    }
 
     if final_video_url:
         payload["final_video_url"] = final_video_url
@@ -42,30 +72,27 @@ def update_generation(generation_id, status, final_video_url=None):
 
     res = requests.patch(url, json=payload, headers=headers)
 
-    if res.status_code not in (200, 204):
-        raise Exception(res.text)
+    if res.status_code >= 300:
+        print("Supabase update failed:", res.text)
 
 
-def download_image_base64(image_url):
+# =====================================================
+# DOWNLOAD IMAGE
+# =====================================================
 
-    print("Downloading image...")
+def download_image_bytes(image_url):
 
     res = requests.get(image_url)
 
     if res.status_code != 200:
         raise Exception("Failed to download image")
 
-    image_bytes = res.content
+    return res.content
 
-    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    mime_type = "image/jpeg"
-
-    if image_url.lower().endswith(".png"):
-        mime_type = "image/png"
-
-    return image_base64, mime_type
-
+# =====================================================
+# GENERATE VIDEO ENDPOINT
+# =====================================================
 
 @app.post("/generate-video")
 def generate_video(req: GenerateVideoRequest):
@@ -78,9 +105,22 @@ def generate_video(req: GenerateVideoRequest):
 
         update_generation(generation_id, "processing")
 
-        image_base64, mime_type = download_image_base64(req.image_url)
+        # Download image
+        print("Downloading image...")
+        image_bytes = download_image_bytes(req.image_url)
 
-        full_prompt = f"{req.prompt}\n\nScript:\n{req.script_text}"
+        mime_type = "image/jpeg"
+
+        full_prompt = f"""
+{req.prompt}
+
+Script:
+{req.script_text}
+
+Create photorealistic talking avatar video.
+Natural facial motion.
+Accurate lip sync.
+"""
 
         print("Calling Veo 3.1 via Vertex AI...")
 
@@ -88,57 +128,41 @@ def generate_video(req: GenerateVideoRequest):
             model="veo-3.1-generate-preview",
             prompt=full_prompt,
             image=types.Image(
-    image_bytes=base64.b64decode(image_base64),
-    mime_type=mime_type
-),
+                image_bytes=image_bytes,
+                mime_type=mime_type
+            ),
             config=types.GenerateVideosConfig(
                 aspect_ratio=req.aspect_ratio
             )
         )
 
-        print("Waiting for Veo generation...")
+        print("Waiting for completion...")
 
         while not operation.done:
+
             time.sleep(10)
-            operation = client.operations.get(operation.name)
+
+            operation = client.operations.get(operation)
 
         if not operation.response.generated_videos:
             raise Exception("No video returned")
 
         video = operation.response.generated_videos[0]
 
-        output_path = f"/tmp/{generation_id}.mp4"
+        video_url = video.video.uri
 
-        print("Downloading video...")
+        print("Video ready:", video_url)
 
-        client.files.download(
-            file=video.video,
-            path=output_path
+        update_generation(
+            generation_id,
+            "completed",
+            video_url
         )
 
-        print("Uploading video to Supabase Storage...")
-
-        with open(output_path, "rb") as f:
-
-            upload_url = f"{SUPABASE_URL}/storage/v1/object/creative-media/video-final/{generation_id}.mp4"
-
-            headers = {
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "Content-Type": "video/mp4"
-            }
-
-            res = requests.put(upload_url, data=f, headers=headers)
-
-            if res.status_code not in (200, 201):
-                raise Exception(res.text)
-
-        public_url = f"{SUPABASE_URL}/storage/v1/object/public/creative-media/video-final/{generation_id}.mp4"
-
-        update_generation(generation_id, "completed", public_url)
-
-        print("SUCCESS:", public_url)
-
-        return {"status": "completed", "video_url": public_url}
+        return {
+            "status": "completed",
+            "video_url": video_url
+        }
 
     except Exception as e:
 
@@ -146,4 +170,7 @@ def generate_video(req: GenerateVideoRequest):
 
         update_generation(generation_id, "failed")
 
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
