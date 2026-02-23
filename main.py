@@ -1,17 +1,16 @@
 import os
 import time
 import requests
-import tempfile
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 import vertexai
-from vertexai.generative_models import GenerativeModel, Part, Image
+from vertexai.preview.generative_models import VideoGenerationModel, Image
 
 
 # =========================
-# ENV VARIABLES
+# ENV
 # =========================
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -21,17 +20,17 @@ GOOGLE_CLOUD_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT")
 GOOGLE_CLOUD_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
 
 if not SUPABASE_URL:
-    raise Exception("SUPABASE_URL not set")
+    raise Exception("SUPABASE_URL missing")
 
 if not SUPABASE_SERVICE_ROLE_KEY:
-    raise Exception("SUPABASE_SERVICE_ROLE_KEY not set")
+    raise Exception("SUPABASE_SERVICE_ROLE_KEY missing")
 
 if not GOOGLE_CLOUD_PROJECT:
-    raise Exception("GOOGLE_CLOUD_PROJECT not set")
+    raise Exception("GOOGLE_CLOUD_PROJECT missing")
 
 
 # =========================
-# INIT VERTEX AI
+# INIT VERTEX
 # =========================
 
 vertexai.init(
@@ -39,7 +38,9 @@ vertexai.init(
     location=GOOGLE_CLOUD_LOCATION
 )
 
-model = GenerativeModel("veo-3.1-generate-preview")
+model = VideoGenerationModel.from_pretrained(
+    "veo-3.1-generate-preview"
+)
 
 
 # =========================
@@ -50,6 +51,7 @@ app = FastAPI()
 
 
 class GenerateVideoRequest(BaseModel):
+
     generation_id: str
     image_url: str
     script_text: str
@@ -84,21 +86,21 @@ def update_generation(generation_id, status, video_url=None):
     res = requests.patch(url, json=payload, headers=headers)
 
     if res.status_code >= 300:
-        print("Supabase update error:", res.text)
+        print(res.text)
 
 
 # =========================
 # DOWNLOAD IMAGE
 # =========================
 
-def download_image(image_url):
+def download_image(url):
 
     print("Downloading image...")
 
-    res = requests.get(image_url)
+    res = requests.get(url)
 
     if res.status_code != 200:
-        raise Exception("Failed to download image")
+        raise Exception("Image download failed")
 
     return res.content
 
@@ -118,7 +120,6 @@ def generate_video(req: GenerateVideoRequest):
 
         update_generation(generation_id, "processing")
 
-        # download image
         image_bytes = download_image(req.image_url)
 
         print("Creating Veo Image object...")
@@ -133,35 +134,25 @@ Script:
 
 Requirements:
 - talking avatar
-- perfect lipsync
 - photorealistic
 - cinematic lighting
+- perfect lipsync
 """
 
-        print("Calling Veo 3.1 via Vertex AI...")
+        print("Calling Veo 3.1...")
 
-        operation = model.generate_videos(
-            contents=[
-                veo_image,
-                full_prompt
-            ]
+        operation = model.generate_video(
+            prompt=full_prompt,
+            image=veo_image
         )
 
-        print("Waiting for completion...")
+        print("Waiting completion...")
 
-        while not operation.done:
+        result = operation.result()
 
-            time.sleep(10)
-            operation = operation.result()
+        video_uri = result.video.uri
 
-        response = operation.response
-
-        if not response.generated_videos:
-            raise Exception("No video generated")
-
-        video_uri = response.generated_videos[0].video.uri
-
-        print("Video URI:", video_uri)
+        print("Video ready:", video_uri)
 
         update_generation(
             generation_id,
@@ -189,4 +180,5 @@ Requirements:
 
 @app.get("/")
 def health():
+
     return {"status": "ok"}
