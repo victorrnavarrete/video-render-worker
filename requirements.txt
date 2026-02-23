@@ -3,3 +3,4 @@ uvicorn
 requests
 python-multipart
 google-genai==1.64.0
+google-cloud-aiplatform==1.70.0
