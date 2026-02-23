@@ -88,9 +88,9 @@ def generate_video(req: GenerateVideoRequest):
             model="veo-3.1-generate-preview",
             prompt=full_prompt,
             image=types.Image(
-                bytes_base64=image_base64,
-                mime_type=mime_type
-            ),
+    image_bytes=base64.b64decode(image_base64),
+    mime_type=mime_type
+),
             config=types.GenerateVideosConfig(
                 aspect_ratio=req.aspect_ratio
             )
