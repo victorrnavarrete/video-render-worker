@@ -5,9 +5,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 import vertexai
-from vertexai.preview.generative_models import GenerativeModel
+from vertexai.preview.generative_models import GenerativeModel, Image
 
-from google.oauth2 import service_account
 
 # =========================
 # ENV VARIABLES
@@ -19,20 +18,21 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
 LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
 
-# =========================
-# INIT VERTEX AI
-# =========================
+if not PROJECT_ID:
+    raise Exception("GOOGLE_CLOUD_PROJECT not set")
 
+# Initialize Vertex AI
 vertexai.init(
     project=PROJECT_ID,
     location=LOCATION
 )
 
 # =========================
-# FASTAPI
+# FASTAPI INIT
 # =========================
 
 app = FastAPI()
+
 
 # =========================
 # REQUEST MODEL
@@ -41,9 +41,10 @@ app = FastAPI()
 class GenerateVideoRequest(BaseModel):
     generation_id: str
     image_url: str
+    script_text: str
     prompt: str
-    aspect_ratio: str = "9:16"
-    duration: int = 4
+    aspect_ratio: str
+    duration: int
 
 
 # =========================
@@ -81,6 +82,8 @@ def update_generation(generation_id, status, video_url=None):
 
 def download_image_bytes(image_url):
 
+    print("Downloading image...")
+
     res = requests.get(image_url)
 
     if res.status_code != 200:
@@ -100,66 +103,68 @@ def generate_video(req: GenerateVideoRequest):
 
     try:
 
-        print("Starting Veo 3.1 generation:", generation_id)
+        print(f"Starting Veo 3.1 generation: {generation_id}")
 
         update_generation(generation_id, "processing")
 
-        # =========================
-        # DOWNLOAD IMAGE
-        # =========================
-
-        print("Downloading image...")
         image_bytes = download_image_bytes(req.image_url)
 
-        # =========================
-        # INIT MODEL
-        # =========================
+        print("Creating Veo Image object...")
+
+        veo_image = Image.from_bytes(image_bytes)
+
+        print("Initializing Veo model...")
 
         model = GenerativeModel(
-            "publishers/google/models/veo-3.1-generate-preview"
+            "projects/{}/locations/{}/publishers/google/models/veo-3.1-generate-preview".format(
+                PROJECT_ID,
+                LOCATION
+            )
         )
 
-        # =========================
-        # GENERATE VIDEO OPERATION
-        # =========================
+        full_prompt = f"""
+        {req.prompt}
+
+        Script:
+        {req.script_text}
+
+        Requirements:
+        - perfect lip sync
+        - realistic talking avatar
+        - cinematic realism
+        - professional lighting
+        """
 
         print("Calling Veo 3.1 via Vertex AI...")
 
         operation = model.generate_videos(
-            prompt=req.prompt,
-            image=image_bytes,
-            aspect_ratio=req.aspect_ratio,
-            duration_seconds=req.duration
+            prompt=full_prompt,
+            image=veo_image,
+            config={
+                "aspect_ratio": req.aspect_ratio,
+                "duration_seconds": req.duration
+            }
         )
 
-        # =========================
-        # WAIT FOR COMPLETION
-        # =========================
+        print("Polling operation...")
 
-        print("Waiting for completion...")
+        while not operation.done:
 
-        while not operation.done():
-            time.sleep(5)
+            print("Still processing...")
+            time.sleep(10)
+
             operation = operation.refresh()
 
-        response = operation.result()
+        print("Operation completed")
 
-        # =========================
-        # EXTRACT VIDEO URL
-        # =========================
+        if not operation.response:
+            raise Exception("No response from Veo")
 
-        if not response.generated_videos:
-            raise Exception("No video returned")
+        video = operation.response.generated_videos[0]
 
-        video = response.generated_videos[0]
+        video_url = video.video.uri
 
-        video_url = video.uri
-
-        print("Video ready:", video_url)
-
-        # =========================
-        # UPDATE SUPABASE
-        # =========================
+        print("Video URL:", video_url)
 
         update_generation(
             generation_id,
@@ -177,6 +182,11 @@ def generate_video(req: GenerateVideoRequest):
         print("ERROR:", str(e))
 
         update_generation(generation_id, "failed")
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
         raise HTTPException(
             status_code=500,
