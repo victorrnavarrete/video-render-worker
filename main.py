@@ -1,36 +1,43 @@
 import os
+import time
+import base64
 import requests
 import httpx
-import vertexai
-
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 
-from vertexai.preview.vision_models import VideoGenerationModel, Image
+import vertexai
+from vertexai.preview.generative_models import Image
+from vertexai.preview.generative_models import ImageVideoGenerationModel
 
-# ENV
+
+# ========================
+# CONFIG
+# ========================
+
 PROJECT_ID = os.environ["GOOGLE_CLOUD_PROJECT"]
 LOCATION = os.environ["GOOGLE_CLOUD_LOCATION"]
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-# INIT VERTEX
-vertexai.init(
-    project=PROJECT_ID,
-    location=LOCATION,
-)
-
-# FASTAPI
 app = FastAPI()
 
-class GenerateVideoRequest(BaseModel):
-    generation_id: str
-    image_url: str
-    prompt: str
+
+# ========================
+# INIT VERTEX AI
+# ========================
+
+vertexai.init(
+    project=PROJECT_ID,
+    location=LOCATION
+)
 
 
-def update_supabase(generation_id, data):
+# ========================
+# SUPABASE UPDATE
+# ========================
+
+async def update_supabase(generation_id, data):
 
     url = f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{generation_id}"
 
@@ -38,80 +45,112 @@ def update_supabase(generation_id, data):
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "return=minimal",
+        "Prefer": "return=minimal"
     }
 
-    httpx.patch(url, headers=headers, json=data)
+    async with httpx.AsyncClient() as client:
+        await client.patch(url, headers=headers, json=data)
 
+
+# ========================
+# DOWNLOAD IMAGE
+# ========================
+
+def download_image(image_url):
+
+    response = requests.get(image_url)
+
+    if response.status_code != 200:
+        raise Exception("Failed to download image")
+
+    return response.content
+
+
+# ========================
+# GENERATE VIDEO
+# ========================
 
 @app.post("/generate-video")
-async def generate_video(req: GenerateVideoRequest):
+async def generate_video(payload: dict):
 
-    generation_id = req.generation_id
+    generation_id = payload["generation_id"]
+    image_url = payload["image_url"]
+    prompt = payload.get("prompt", "")
 
     try:
 
-        print("Starting Veo 3.1 generation:", generation_id)
+        print(f"Starting Veo 3.1 generation: {generation_id}")
 
-        update_supabase(generation_id, {"status": "processing"})
+        await update_supabase(generation_id, {
+            "status": "processing"
+        })
 
-        # DOWNLOAD IMAGE
+        # download image
         print("Downloading image...")
-        image_bytes = requests.get(req.image_url).content
+        image_bytes = download_image(image_url)
 
-        veo_image = Image.from_bytes(image_bytes)
+        print("Creating Veo Image object...")
+        image = Image.from_bytes(image_bytes)
 
         print("Loading Veo model...")
-
-        model = VideoGenerationModel.from_pretrained(
+        model = ImageVideoGenerationModel.from_pretrained(
             "veo-3.1-generate-preview"
         )
 
         print("Generating video...")
 
         operation = model.generate_video(
-            image=veo_image,
-            prompt=req.prompt,
+
+            image=image,
+
+            prompt=prompt,
+
             aspect_ratio="9:16",
-            duration_seconds=5,
+
+            duration_seconds=8,
+
+            fps=24,
+
+            person_generation="allow_all"
         )
 
-        print("Waiting result...")
+        print("Waiting for result...")
 
-        video = operation.result()
+        result = operation.result()
+
+        video = result.generated_videos[0]
 
         video_bytes = video.video_bytes
 
-        file_path = f"/tmp/{generation_id}.mp4"
+        # upload to supabase storage
+        filename = f"{generation_id}.mp4"
 
-        with open(file_path, "wb") as f:
-            f.write(video_bytes)
-
-        print("Uploading to Supabase Storage...")
-
-        upload_url = f"{SUPABASE_URL}/storage/v1/object/videos/{generation_id}.mp4"
+        upload_url = f"{SUPABASE_URL}/storage/v1/object/videos/{filename}"
 
         headers = {
             "apikey": SUPABASE_KEY,
             "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Content-Type": "video/mp4",
+            "Content-Type": "video/mp4"
         }
 
-        with open(file_path, "rb") as f:
-            httpx.post(upload_url, headers=headers, content=f.read())
-
-        public_url = f"{SUPABASE_URL}/storage/v1/object/public/videos/{generation_id}.mp4"
-
-        update_supabase(
-            generation_id,
-            {
-                "status": "completed",
-                "video_url": public_url,
-                "final_video_url": public_url,
-            },
+        upload_response = requests.post(
+            upload_url,
+            headers=headers,
+            data=video_bytes
         )
 
-        print("SUCCESS")
+        if upload_response.status_code not in [200, 201]:
+            raise Exception(upload_response.text)
+
+        public_url = f"{SUPABASE_URL}/storage/v1/object/public/videos/{filename}"
+
+        print("Saving URL in Supabase...")
+
+        await update_supabase(generation_id, {
+            "status": "completed",
+            "video_url": public_url,
+            "final_video_url": public_url
+        })
 
         return {"success": True}
 
@@ -119,12 +158,9 @@ async def generate_video(req: GenerateVideoRequest):
 
         print("ERROR:", str(e))
 
-        update_supabase(
-            generation_id,
-            {
-                "status": "failed",
-                "error": str(e),
-            },
-        )
+        await update_supabase(generation_id, {
+            "status": "failed",
+            "error": str(e)
+        })
 
         raise HTTPException(status_code=500, detail=str(e))
