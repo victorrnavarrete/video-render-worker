@@ -8,6 +8,9 @@ RUN pip install --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
+COPY service-account.json .
+
+ENV GOOGLE_APPLICATION_CREDENTIALS=/app/service-account.json
 
 EXPOSE 8080
 
