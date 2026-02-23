@@ -2,6 +2,5 @@ fastapi
 uvicorn
 requests
 python-multipart
-google-genai==1.64.0
-google-cloud-aiplatform==1.70.0
-vertexai
+google-cloud-aiplatform>=1.66.0
+vertexai>=1.66.0
