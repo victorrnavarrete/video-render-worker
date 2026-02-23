@@ -1,134 +1,200 @@
 import os
 import time
 import base64
+import httpx
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from supabase import create_client, Client
-
 import vertexai
-from vertexai.preview.generative_models import GenerativeModel, Part, Image
+from vertexai.preview.generative_models import GenerativeModel, Image
 
-# --------------------------------------------------
+# =========================
 # ENV
-# --------------------------------------------------
+# =========================
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-GOOGLE_PROJECT = os.environ["GOOGLE_CLOUD_PROJECT"]
-GOOGLE_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+PROJECT_ID = os.environ["GOOGLE_CLOUD_PROJECT"]
+LOCATION = os.environ["GOOGLE_CLOUD_LOCATION"]
 
-# --------------------------------------------------
-# INIT
-# --------------------------------------------------
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# =========================
+# INIT VERTEX
+# =========================
 
 vertexai.init(
-    project=GOOGLE_PROJECT,
-    location=GOOGLE_LOCATION,
+    project=PROJECT_ID,
+    location=LOCATION,
 )
 
-app = FastAPI()
+# =========================
+# FASTAPI
+# =========================
 
-# --------------------------------------------------
-# REQUEST MODEL
-# --------------------------------------------------
+app = FastAPI()
 
 class GenerateVideoRequest(BaseModel):
     generation_id: str
     image_url: str
     prompt: str
+    script_text: str | None = None
+    aspect_ratio: str = "9:16"
+    duration: int = 5
 
+# =========================
+# SUPABASE REST HELPERS
+# =========================
 
-# --------------------------------------------------
-# HELPER
-# --------------------------------------------------
+def supabase_update(generation_id, payload):
 
-def download_image_bytes(url: str) -> bytes:
-    response = requests.get(url)
-    response.raise_for_status()
+    url = f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{generation_id}"
+
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
+    }
+
+    response = httpx.patch(url, headers=headers, json=payload, timeout=60)
+
+    if response.status_code >= 300:
+        raise Exception(f"Supabase update failed: {response.text}")
+
+def supabase_upload_video(generation_id, video_bytes):
+
+    path = f"video-final/{generation_id}.mp4"
+
+    url = f"{SUPABASE_URL}/storage/v1/object/creative-media/{path}"
+
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "video/mp4"
+    }
+
+    response = httpx.post(
+        url,
+        headers=headers,
+        content=video_bytes,
+        timeout=300
+    )
+
+    if response.status_code >= 300:
+        raise Exception(f"Upload failed: {response.text}")
+
+    public_url = f"{SUPABASE_URL}/storage/v1/object/public/creative-media/{path}"
+
+    return public_url
+
+# =========================
+# DOWNLOAD IMAGE
+# =========================
+
+def download_image_bytes(image_url):
+
+    response = requests.get(image_url, timeout=60)
+
+    if response.status_code != 200:
+        raise Exception("Failed to download image")
+
     return response.content
 
-
-# --------------------------------------------------
-# ROUTE
-# --------------------------------------------------
+# =========================
+# GENERATE VIDEO
+# =========================
 
 @app.post("/generate-video")
 def generate_video(req: GenerateVideoRequest):
 
     generation_id = req.generation_id
-    image_url = req.image_url
-    prompt = req.prompt
-
-    print(f"Starting Veo generation: {generation_id}")
-
-    # update status → generating
-    supabase.table("video_generations").update({
-        "status": "generating"
-    }).eq("id", generation_id).execute()
 
     try:
 
-        # download image
-        image_bytes = download_image_bytes(image_url)
+        print("Starting Veo 3.1 generation:", generation_id)
 
-        # create Veo image object
+        supabase_update(generation_id, {
+            "status": "processing"
+        })
+
+        # download image
+        print("Downloading image...")
+        image_bytes = download_image_bytes(req.image_url)
+
+        # create Image object
         veo_image = Image.from_bytes(image_bytes)
 
+        # init model
+        print("Calling Veo 3.1 via Vertex AI...")
         model = GenerativeModel("veo-3.1-generate-preview")
 
-        print("Calling Veo...")
+        full_prompt = req.prompt
+
+        if req.script_text:
+            full_prompt += "\n\nSpeech:\n" + req.script_text
 
         operation = model.generate_content(
-            [
-                Part.from_image(veo_image),
-                prompt
-            ],
+            contents=[full_prompt, veo_image],
             generation_config={
-                "response_modalities": ["VIDEO"]
-            }
+                "video_config": {
+                    "duration_seconds": req.duration,
+                    "aspect_ratio": req.aspect_ratio
+                }
+            },
+            stream=False
         )
 
-        print("Waiting for result...")
+        video_part = None
 
-        video_bytes = operation.candidates[0].content.parts[0].inline_data.data
+        for part in operation.candidates[0].content.parts:
+            if hasattr(part, "file_data"):
+                video_part = part.file_data
 
-        video_path = f"/tmp/{generation_id}.mp4"
+        if not video_part:
+            raise Exception("No video returned")
 
-        with open(video_path, "wb") as f:
-            f.write(video_bytes)
+        video_uri = video_part.file_uri
 
-        # upload to supabase storage
-        storage_path = f"videos/{generation_id}.mp4"
+        print("Video URI:", video_uri)
 
-        supabase.storage.from_("videos").upload(
-            storage_path,
-            video_path,
-            {"content-type": "video/mp4"}
+        # download video
+        print("Downloading video file...")
+        video_response = httpx.get(video_uri, timeout=600)
+
+        video_bytes = video_response.content
+
+        # upload to supabase
+        print("Uploading to Supabase Storage...")
+        public_url = supabase_upload_video(
+            generation_id,
+            video_bytes
         )
 
-        video_url = f"{SUPABASE_URL}/storage/v1/object/public/videos/{storage_path}"
+        print("Updating Supabase row...")
 
-        supabase.table("video_generations").update({
+        supabase_update(generation_id, {
             "status": "completed",
-            "video_url": video_url,
-            "final_video_url": video_url
-        }).eq("id", generation_id).execute()
+            "video_url": public_url,
+            "final_video_url": public_url
+        })
 
-        print("Success")
+        print("Completed successfully")
 
-        return {"success": True}
+        return {
+            "status": "completed",
+            "video_url": public_url
+        }
 
     except Exception as e:
 
         print("ERROR:", str(e))
 
-        supabase.table("video_generations").update({
-            "status": "failed"
-        }).eq("id", generation_id).execute()
+        try:
+            supabase_update(generation_id, {
+                "status": "failed"
+            })
+        except:
+            pass
 
-        raise e
+        raise HTTPException(status_code=500, detail=str(e))
