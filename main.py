@@ -1,154 +1,103 @@
 import os
 import time
+import base64
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-import vertexai
-from vertexai.preview.vision_models import VideoGenerationModel
+from google.cloud import aiplatform_v1
+from google.oauth2 import service_account
 
+from supabase import create_client
 
-# =========================
 # ENV
-# =========================
+PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
+LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
+CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
-LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-
-if not PROJECT_ID:
-    raise Exception("GOOGLE_CLOUD_PROJECT not set")
-
-vertexai.init(
-    project=PROJECT_ID,
-    location=LOCATION
+# Init clients
+credentials = service_account.Credentials.from_service_account_file(
+    CREDENTIALS_PATH
 )
+
+prediction_client = aiplatform_v1.PredictionServiceClient(
+    credentials=credentials
+)
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI()
 
+MODEL = "projects/{}/locations/{}/publishers/google/models/veo-3.1-generate-preview".format(
+    PROJECT_ID, LOCATION
+)
 
-# =========================
-# REQUEST
-# =========================
 
 class GenerateVideoRequest(BaseModel):
     generation_id: str
     image_url: str
-    script_text: str
     prompt: str
-    aspect_ratio: str
-    duration: int
 
 
-# =========================
-# SUPABASE UPDATE
-# =========================
+def download_image_as_base64(url):
+    response = requests.get(url)
 
-def update_generation(generation_id, status, video_url=None):
-
-    url = f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{generation_id}"
-
-    payload = {
-        "status": status
-    }
-
-    if video_url:
-        payload["video_url"] = video_url
-        payload["final_video_url"] = video_url
-
-    headers = {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal"
-    }
-
-    requests.patch(url, json=payload, headers=headers)
-
-
-# =========================
-# DOWNLOAD IMAGE
-# =========================
-
-def download_image(image_url):
-
-    print("Downloading image...")
-
-    res = requests.get(image_url)
-
-    if res.status_code != 200:
+    if response.status_code != 200:
         raise Exception("Failed to download image")
 
-    path = "/tmp/input.jpg"
+    return base64.b64encode(response.content).decode("utf-8")
 
-    with open(path, "wb") as f:
-        f.write(res.content)
-
-    return path
-
-
-# =========================
-# GENERATE VIDEO
-# =========================
 
 @app.post("/generate-video")
-def generate_video(req: GenerateVideoRequest):
+async def generate_video(req: GenerateVideoRequest):
 
     generation_id = req.generation_id
 
     try:
 
-        print("Starting Veo 3.1 generation:", generation_id)
+        print("Starting Veo generation:", generation_id)
 
-        update_generation(generation_id, "processing")
+        supabase.table("video_generations").update({
+            "status": "processing"
+        }).eq("id", generation_id).execute()
 
-        image_path = download_image(req.image_url)
+        image_base64 = download_image_as_base64(req.image_url)
 
-        print("Loading Veo model...")
+        instance = {
+            "prompt": req.prompt,
+            "image": {
+                "bytesBase64Encoded": image_base64,
+                "mimeType": "image/jpeg"
+            }
+        }
 
-        model = VideoGenerationModel.from_pretrained(
-            "veo-3.1-generate-preview"
+        endpoint = prediction_client.endpoint_path(
+            project=PROJECT_ID,
+            location=LOCATION,
+            endpoint="publishers/google/models/veo-3.1-generate-preview"
         )
 
-        full_prompt = f"""
-{req.prompt}
-
-Script:
-{req.script_text}
-
-Requirements:
-perfect lip sync,
-realistic talking avatar,
-cinematic realism
-"""
-
-        print("Calling Veo...")
-
-        operation = model.generate_video(
-            prompt=full_prompt,
-            image=image_path,
-            aspect_ratio=req.aspect_ratio,
-            duration_seconds=req.duration
+        operation = prediction_client.predict(
+            endpoint=endpoint,
+            instances=[instance],
+            parameters={}
         )
 
-        print("Polling Veo...")
-
-        video = operation.result()
-
-        video_uri = video.uri
+        video_uri = operation.predictions[0]["video"]["uri"]
 
         print("Video URI:", video_uri)
 
-        update_generation(
-            generation_id,
-            "completed",
-            video_uri
-        )
+        supabase.table("video_generations").update({
+            "status": "completed",
+            "video_url": video_uri,
+            "final_video_url": video_uri
+        }).eq("id", generation_id).execute()
 
         return {
-            "status": "completed",
+            "success": True,
             "video_url": video_uri
         }
 
@@ -156,6 +105,8 @@ cinematic realism
 
         print("ERROR:", str(e))
 
-        update_generation(generation_id, "failed")
+        supabase.table("video_generations").update({
+            "status": "failed"
+        }).eq("id", generation_id).execute()
 
         raise HTTPException(status_code=500, detail=str(e))
