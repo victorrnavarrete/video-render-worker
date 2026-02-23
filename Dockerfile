@@ -8,10 +8,7 @@ RUN pip install --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
-COPY service-account.json .
-
-ENV GOOGLE_APPLICATION_CREDENTIALS=/app/service-account.json
 
 EXPOSE 8080
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["sh", "-c", "echo $GOOGLE_APPLICATION_CREDENTIALS_JSON > /tmp/service-account.json && export GOOGLE_APPLICATION_CREDENTIALS=/tmp/service-account.json && uvicorn main:app --host 0.0.0.0 --port 8080"]
