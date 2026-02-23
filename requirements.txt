@@ -1,7 +1,9 @@
-fastapi
-uvicorn
-requests
-python-multipart
+fastapi==0.129.2
+uvicorn==0.41.0
+requests==2.32.5
+python-multipart==0.0.22
+
+supabase==2.4.0
+
 google-cloud-aiplatform==1.71.1
-google-genai==1.64.0
-supabase
+google-auth==2.48.0
