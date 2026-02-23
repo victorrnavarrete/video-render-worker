@@ -4,55 +4,53 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from google import genai
-from google.genai import types
+import vertexai
+from vertexai.preview.generative_models import GenerativeModel
 
-# =====================================================
-# ENVIRONMENT VARIABLES
-# =====================================================
+from google.oauth2 import service_account
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+# =========================
+# ENV VARIABLES
+# =========================
 
-# Vertex AI auth via Service Account JSON
-# IMPORTANT: this must point to the JSON file path
-GOOGLE_APPLICATION_CREDENTIALS = os.environ.get(
-    "GOOGLE_APPLICATION_CREDENTIALS_JSON"
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
+LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+# =========================
+# INIT VERTEX AI
+# =========================
+
+vertexai.init(
+    project=PROJECT_ID,
+    location=LOCATION
 )
 
-if GOOGLE_APPLICATION_CREDENTIALS:
-    path = "/tmp/google_credentials.json"
-    with open(path, "w") as f:
-        f.write(GOOGLE_APPLICATION_CREDENTIALS)
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
-
-# Force Vertex AI mode
-os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
-
-# Create client
-client = genai.Client()
-
-# =====================================================
+# =========================
 # FASTAPI
-# =====================================================
+# =========================
 
 app = FastAPI()
 
+# =========================
+# REQUEST MODEL
+# =========================
 
 class GenerateVideoRequest(BaseModel):
     generation_id: str
     image_url: str
-    script_text: str
     prompt: str
-    aspect_ratio: str
-    duration: int
+    aspect_ratio: str = "9:16"
+    duration: int = 4
 
 
-# =====================================================
+# =========================
 # SUPABASE UPDATE
-# =====================================================
+# =========================
 
-def update_generation(generation_id, status, final_video_url=None):
+def update_generation(generation_id, status, video_url=None):
 
     url = f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{generation_id}"
 
@@ -60,8 +58,9 @@ def update_generation(generation_id, status, final_video_url=None):
         "status": status
     }
 
-    if final_video_url:
-        payload["final_video_url"] = final_video_url
+    if video_url:
+        payload["video_url"] = video_url
+        payload["final_video_url"] = video_url
 
     headers = {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
@@ -76,9 +75,9 @@ def update_generation(generation_id, status, final_video_url=None):
         print("Supabase update failed:", res.text)
 
 
-# =====================================================
+# =========================
 # DOWNLOAD IMAGE
-# =====================================================
+# =========================
 
 def download_image_bytes(image_url):
 
@@ -90,9 +89,9 @@ def download_image_bytes(image_url):
     return res.content
 
 
-# =====================================================
+# =========================
 # GENERATE VIDEO ENDPOINT
-# =====================================================
+# =========================
 
 @app.post("/generate-video")
 def generate_video(req: GenerateVideoRequest):
@@ -101,57 +100,66 @@ def generate_video(req: GenerateVideoRequest):
 
     try:
 
-        print(f"Starting Veo 3.1 generation: {generation_id}")
+        print("Starting Veo 3.1 generation:", generation_id)
 
         update_generation(generation_id, "processing")
 
-        # Download image
+        # =========================
+        # DOWNLOAD IMAGE
+        # =========================
+
         print("Downloading image...")
         image_bytes = download_image_bytes(req.image_url)
 
-        mime_type = "image/jpeg"
+        # =========================
+        # INIT MODEL
+        # =========================
 
-        full_prompt = f"""
-{req.prompt}
+        model = GenerativeModel(
+            "publishers/google/models/veo-3.1-generate-preview"
+        )
 
-Script:
-{req.script_text}
-
-Create photorealistic talking avatar video.
-Natural facial motion.
-Accurate lip sync.
-"""
+        # =========================
+        # GENERATE VIDEO OPERATION
+        # =========================
 
         print("Calling Veo 3.1 via Vertex AI...")
 
-        operation = client.models.generate_videos(
-            model="veo-3.1-generate-preview",
-            prompt=full_prompt,
-            image=types.Image(
-                image_bytes=image_bytes,
-                mime_type=mime_type
-            ),
-            config=types.GenerateVideosConfig(
-                aspect_ratio=req.aspect_ratio
-            )
+        operation = model.generate_videos(
+            prompt=req.prompt,
+            image=image_bytes,
+            aspect_ratio=req.aspect_ratio,
+            duration_seconds=req.duration
         )
+
+        # =========================
+        # WAIT FOR COMPLETION
+        # =========================
 
         print("Waiting for completion...")
 
-        while not operation.done:
+        while not operation.done():
+            time.sleep(5)
+            operation = operation.refresh()
 
-            time.sleep(10)
+        response = operation.result()
 
-            operation = client.operations.get(operation)
+        # =========================
+        # EXTRACT VIDEO URL
+        # =========================
 
-        if not operation.response.generated_videos:
+        if not response.generated_videos:
             raise Exception("No video returned")
 
-        video = operation.response.generated_videos[0]
+        video = response.generated_videos[0]
 
-        video_url = video.video.uri
+        video_url = video.uri
 
         print("Video ready:", video_url)
+
+        # =========================
+        # UPDATE SUPABASE
+        # =========================
 
         update_generation(
             generation_id,
