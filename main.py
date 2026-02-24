@@ -1,7 +1,7 @@
 import os
 import json
-import time
 import base64
+import asyncio
 import httpx
 
 from fastapi import FastAPI
@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
+
 
 # =====================================================
 # CONFIG
@@ -22,8 +23,9 @@ SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
 SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"]
 
+
 # =====================================================
-# LOAD CREDENTIALS FROM ENV JSON (NOT FILE)
+# AUTH
 # =====================================================
 
 credentials_info = json.loads(SERVICE_ACCOUNT_JSON)
@@ -35,13 +37,19 @@ credentials = service_account.Credentials.from_service_account_info(
 
 credentials.refresh(Request())
 
-ACCESS_TOKEN = credentials.token
+
+def get_access_token():
+    if not credentials.valid:
+        credentials.refresh(Request())
+    return credentials.token
+
 
 # =====================================================
 # FASTAPI
 # =====================================================
 
 app = FastAPI()
+
 
 # =====================================================
 # REQUEST MODEL
@@ -52,25 +60,37 @@ class GenerateVideoRequest(BaseModel):
     image_url: str
     prompt: str
 
+
 # =====================================================
 # DOWNLOAD IMAGE
 # =====================================================
 
 async def download_image_bytes(url: str) -> bytes:
+
     async with httpx.AsyncClient(timeout=60) as client:
+
         response = await client.get(url)
+
         response.raise_for_status()
+
         return response.content
 
+
 # =====================================================
-# CALL VERTEX PREDICT LONG RUNNING
+# CALL VEO PREDICT LONG RUNNING
 # =====================================================
 
 async def call_veo(image_bytes: bytes, prompt: str):
 
-    endpoint = f"https://us-central1-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/us-central1/publishers/google/models/veo-3.1-generate-preview:predictLongRunning"
+    access_token = get_access_token()
 
-    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+    endpoint = (
+        f"https://{LOCATION}-aiplatform.googleapis.com/v1/"
+        f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/"
+        f"veo-3.1-generate-preview:predictLongRunning"
+    )
+
+    image_base64 = base64.b64encode(image_bytes).decode()
 
     payload = {
         "instances": [
@@ -85,7 +105,7 @@ async def call_veo(image_bytes: bytes, prompt: str):
     }
 
     headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json"
     }
 
@@ -99,32 +119,28 @@ async def call_veo(image_bytes: bytes, prompt: str):
 
         operation_name = operation["name"]
 
-        # poll operation
-        operation_id = operation_name.split("/")[-1]
+        poll_url = f"https://{LOCATION}-aiplatform.googleapis.com/v1/{operation_name}"
 
-operation_url = (
-    f"https://{LOCATION}-aiplatform.googleapis.com/v1/"
-    f"projects/{PROJECT_ID}/locations/{LOCATION}/operations/{operation_id}"
-)
-
+        # POLLING LOOP (CORRECT INDENTATION)
         while True:
 
-            poll = await client.get(poll_url, headers=headers)
+            poll_response = await client.get(poll_url, headers=headers)
 
-            poll.raise_for_status()
+            poll_response.raise_for_status()
 
-            result = poll.json()
+            poll_data = poll_response.json()
 
-            if result.get("done"):
+            if poll_data.get("done", False):
 
-                video_uri = result["response"]["videos"][0]["uri"]
+                video_uri = poll_data["response"]["videos"][0]["uri"]
 
                 return video_uri
 
             await asyncio.sleep(5)
 
+
 # =====================================================
-# SAVE TO SUPABASE
+# UPDATE SUPABASE
 # =====================================================
 
 async def update_supabase(generation_id: str, video_url: str):
@@ -150,6 +166,7 @@ async def update_supabase(generation_id: str, video_url: str):
 
         response.raise_for_status()
 
+
 # =====================================================
 # ENDPOINT
 # =====================================================
@@ -159,13 +176,23 @@ async def generate_video(req: GenerateVideoRequest):
 
     try:
 
-        print(f"Starting Veo 3.1 generation: {req.generation_id}")
+        print("Starting Veo 3.1 generation:", req.generation_id)
+
+        print("Downloading image...")
 
         image_bytes = await download_image_bytes(req.image_url)
 
+        print("Calling Veo 3.1 via Vertex PredictLongRunning...")
+
         video_url = await call_veo(image_bytes, req.prompt)
 
+        print("Video generated:", video_url)
+
+        print("Updating Supabase...")
+
         await update_supabase(req.generation_id, video_url)
+
+        print("Done")
 
         return {
             "status": "success",
