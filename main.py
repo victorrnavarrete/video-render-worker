@@ -3,9 +3,11 @@ import json
 import base64
 import asyncio
 import uuid
+import subprocess
+import tempfile
 import httpx
 
-from typing import Optional
+from typing import Optional, List
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -47,14 +49,13 @@ def get_access_token() -> str:
     return credentials.token
 
 # =====================================================
-# REQUEST MODEL
+# REQUEST MODELS
 # =====================================================
 
 class GenerateVideoRequest(BaseModel):
     generation_id: str
     image_url: str
     prompt: str
-    # Campos opcionais de metadados para enriquecer o prompt
     emotion_type: Optional[str] = None
     camera_mode: Optional[str] = None
     body_motion_type: Optional[str] = None
@@ -65,6 +66,10 @@ class GenerateVideoRequest(BaseModel):
     behavior_type: Optional[str] = None
     intent_type: Optional[str] = None
     aspect_ratio: Optional[str] = None
+
+class MergeVideosRequest(BaseModel):
+    sequence_id: str
+    video_urls: List[str]
 
 # =====================================================
 # BUILD VEO PROMPT (enriquece com metadados cinematicos)
@@ -140,7 +145,6 @@ def build_veo_prompt(req: GenerateVideoRequest) -> str:
     if req.intent_type and req.intent_type in intent_map:
         parts.append(intent_map[req.intent_type])
 
-    # Qualidade base sempre aplicada
     parts += [
         "photorealistic",
         "4K quality",
@@ -177,9 +181,10 @@ async def download_image_bytes(url: str):
 # UPLOAD VIDEO TO SUPABASE STORAGE
 # =====================================================
 
-async def upload_video_to_supabase(video_bytes: bytes) -> str:
+async def upload_video_to_supabase(video_bytes: bytes, file_name: str = None) -> str:
 
-    file_name = f"{uuid.uuid4()}.mp4"
+    if not file_name:
+        file_name = f"{uuid.uuid4()}.mp4"
 
     upload_url = f"{SUPABASE_URL}/storage/v1/object/videos/{file_name}"
 
@@ -189,7 +194,7 @@ async def upload_video_to_supabase(video_bytes: bytes) -> str:
         "Content-Type": "video/mp4",
     }
 
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=300) as client:
 
         response = await client.post(upload_url, headers=headers, content=video_bytes)
 
@@ -288,13 +293,11 @@ async def call_veo(image_bytes: bytes, prompt: str):
 
                 video = videos[0]
 
-                # Caso 1: URI no GCS ou URI direta
                 video_uri = video.get("gcsUri") or video.get("uri")
                 if video_uri:
                     print("Video URI recebido:", video_uri)
                     return video_uri
 
-                # Caso 2: Video retornado como bytes base64
                 video_b64 = video.get("bytesBase64Encoded")
                 if video_b64:
                     print("Video retornado como bytes, fazendo upload para Supabase...")
@@ -335,7 +338,7 @@ async def update_supabase(generation_id: str, video_url: str):
         response.raise_for_status()
 
 # =====================================================
-# ENDPOINT
+# ENDPOINT: GENERATE SINGLE VIDEO (cena individual)
 # =====================================================
 
 @app.post("/generate-video")
@@ -361,6 +364,89 @@ async def generate_video(req: GenerateVideoRequest):
     except Exception as e:
 
         print("ERROR:", str(e))
+
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+# =====================================================
+# ENDPOINT: MERGE VIDEOS (une cenas aprovadas em 1 video final)
+# =====================================================
+
+@app.post("/merge-videos")
+async def merge_videos(req: MergeVideosRequest):
+
+    try:
+
+        print(f"Starting merge for sequence: {req.sequence_id} | {len(req.video_urls)} clips")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+
+            # 1. Download todos os clips
+            clip_paths = []
+
+            async with httpx.AsyncClient(timeout=120) as client:
+
+                for i, url in enumerate(req.video_urls):
+
+                    print(f"Downloading clip {i + 1}/{len(req.video_urls)}: {url}")
+
+                    response = await client.get(url)
+
+                    response.raise_for_status()
+
+                    clip_path = os.path.join(tmpdir, f"clip_{i:03d}.mp4")
+
+                    with open(clip_path, "wb") as f:
+                        f.write(response.content)
+
+                    clip_paths.append(clip_path)
+
+            # 2. Cria arquivo de lista para FFmpeg
+            concat_file = os.path.join(tmpdir, "concat.txt")
+
+            with open(concat_file, "w") as f:
+                for clip_path in clip_paths:
+                    f.write(f"file '{clip_path}'\n")
+
+            # 3. Executa FFmpeg para concatenar
+            output_path = os.path.join(tmpdir, "merged.mp4")
+
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", concat_file,
+                    "-c", "copy",
+                    output_path
+                ],
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode != 0:
+                raise Exception(f"FFmpeg error: {result.stderr}")
+
+            print("FFmpeg merge completed successfully")
+
+            # 4. Upload do video final para Supabase
+            with open(output_path, "rb") as f:
+                merged_bytes = f.read()
+
+            file_name = f"sequence_{req.sequence_id}.mp4"
+
+            public_url = await upload_video_to_supabase(merged_bytes, file_name)
+
+            return {
+                "status": "success",
+                "video_url": public_url
+            }
+
+    except Exception as e:
+
+        print(f"ERROR in merge: {str(e)}")
 
         return {
             "status": "error",
