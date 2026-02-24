@@ -1,13 +1,29 @@
 import os
-import uuid
-import base64
+import json
 import time
+import base64
 import requests
 import httpx
 
-from fastapi import FastAPI, Request
-from google.cloud import aiplatform_v1
-from google.protobuf import struct_pb2
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+# =========================
+# CREATE SERVICE ACCOUNT FILE AT RUNTIME
+# =========================
+
+if "GOOGLE_APPLICATION_CREDENTIALS_JSON" in os.environ:
+    creds_path = "/tmp/service-account.json"
+    with open(creds_path, "w") as f:
+        f.write(os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"])
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+
+# =========================
+# IMPORT VERTEX AI AFTER CREDENTIAL SETUP
+# =========================
+
+import vertexai
+from vertexai.preview.generative_models import GenerativeModel, Part, GenerationConfig
 
 # =========================
 # ENV VARS
@@ -16,10 +32,19 @@ from google.protobuf import struct_pb2
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-PROJECT_ID = os.environ["GOOGLE_CLOUD_PROJECT"]
-LOCATION = os.environ["GOOGLE_CLOUD_LOCATION"]
+GOOGLE_PROJECT = os.environ["GOOGLE_CLOUD_PROJECT"]
+GOOGLE_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
 
-MODEL_ID = "veo-3.1-generate-preview"
+# =========================
+# INIT VERTEX AI
+# =========================
+
+vertexai.init(
+    project=GOOGLE_PROJECT,
+    location=GOOGLE_LOCATION
+)
+
+model = GenerativeModel("veo-3.1-generate-preview")
 
 # =========================
 # FASTAPI
@@ -27,13 +52,29 @@ MODEL_ID = "veo-3.1-generate-preview"
 
 app = FastAPI()
 
+class GenerateVideoRequest(BaseModel):
+    generation_id: str
+    image_url: str
+    prompt: str
+    aspect_ratio: str
+    duration: int
+    script_text: str | None = None
+
 # =========================
-# SUPABASE REST UPDATE
+# SUPABASE UPDATE (REST)
 # =========================
 
-async def update_generation(generation_id, data):
+def update_generation(generation_id, status, video_url=None):
 
     url = f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{generation_id}"
+
+    payload = {
+        "status": status
+    }
+
+    if video_url:
+        payload["video_url"] = video_url
+        payload["final_video_url"] = video_url
 
     headers = {
         "apikey": SUPABASE_KEY,
@@ -42,119 +83,118 @@ async def update_generation(generation_id, data):
         "Prefer": "return=minimal"
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        await client.patch(url, headers=headers, json=data)
+    response = httpx.patch(url, headers=headers, json=payload)
 
+    if response.status_code not in [200, 204]:
+        print("Supabase update failed:", response.text)
 
 # =========================
 # DOWNLOAD IMAGE
 # =========================
 
-def download_image(url):
+def download_image_bytes(url):
 
-    r = requests.get(url)
+    response = requests.get(url)
 
-    if r.status_code != 200:
+    if response.status_code != 200:
         raise Exception("Failed to download image")
 
-    return r.content
-
-
-# =========================
-# GENERATE VIDEO
-# =========================
-
-def generate_video(prompt, image_bytes):
-
-    client = aiplatform_v1.PredictionServiceClient()
-
-    endpoint = f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}"
-
-    image_base64 = base64.b64encode(image_bytes).decode()
-
-    instance = struct_pb2.Value()
-
-    struct_pb2.Struct().update({
-        "prompt": prompt,
-        "image": {
-            "bytesBase64Encoded": image_base64,
-            "mimeType": "image/jpeg"
-        }
-    })
-
-    instance = struct_pb2.Value(
-        struct_value=struct_pb2.Struct(
-            fields={
-                "prompt": struct_pb2.Value(string_value=prompt),
-                "image": struct_pb2.Value(
-                    struct_value=struct_pb2.Struct(
-                        fields={
-                            "bytesBase64Encoded": struct_pb2.Value(string_value=image_base64),
-                            "mimeType": struct_pb2.Value(string_value="image/jpeg"),
-                        }
-                    )
-                )
-            }
-        )
-    )
-
-    operation = client.predict(
-        endpoint=endpoint,
-        instances=[instance]
-    )
-
-    response = operation.predictions
-
-    video_base64 = response[0]["video"]
-
-    video_bytes = base64.b64decode(video_base64)
-
-    return video_bytes
-
+    return response.content
 
 # =========================
-# ROUTE
+# GENERATE VIDEO ENDPOINT
 # =========================
 
 @app.post("/generate-video")
-async def generate_video_route(request: Request):
+def generate_video(req: GenerateVideoRequest):
 
-    body = await request.json()
-
-    generation_id = body["generation_id"]
-    image_url = body["image_url"]
-    prompt = body["prompt"]
-
-    print(f"Starting Veo 3.1 generation: {generation_id}")
+    generation_id = req.generation_id
 
     try:
 
-        await update_generation(generation_id, {
-            "status": "processing"
-        })
+        print(f"Starting Veo 3.1 generation: {generation_id}")
 
-        image_bytes = download_image(image_url)
+        update_generation(generation_id, "processing")
 
-        video_bytes = generate_video(prompt, image_bytes)
+        # Download image
+        print("Downloading image...")
+        image_bytes = download_image_bytes(req.image_url)
 
-        video_base64 = base64.b64encode(video_bytes).decode()
+        # Create Veo Part object
+        image_part = Part.from_data(
+            data=image_bytes,
+            mime_type="image/jpeg"
+        )
 
-        video_url = f"data:video/mp4;base64,{video_base64}"
+        # Build prompt
+        full_prompt = req.prompt
+        if req.script_text:
+            full_prompt += f"\n\nSpeech: {req.script_text}"
 
-        await update_generation(generation_id, {
+        print("Calling Veo 3.1 via Vertex AI...")
+
+        # Generate video operation
+        operation = model.generate_video(
+            prompt=full_prompt,
+            image=image_part,
+            generation_config=GenerationConfig(
+                aspect_ratio=req.aspect_ratio
+            )
+        )
+
+        # Wait until done
+        while not operation.done:
+            time.sleep(10)
+            operation = operation.refresh()
+
+        if not operation.response:
+            raise Exception("No response from Veo")
+
+        video = operation.response.generated_videos[0]
+
+        video_bytes = video.video_bytes
+
+        # Upload to Supabase Storage
+        print("Uploading video to Supabase Storage...")
+
+        file_path = f"video-final/{generation_id}.mp4"
+
+        upload_url = f"{SUPABASE_URL}/storage/v1/object/creative-media/{file_path}"
+
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "video/mp4"
+        }
+
+        upload_response = httpx.post(
+            upload_url,
+            headers=headers,
+            content=video_bytes
+        )
+
+        if upload_response.status_code not in [200, 201]:
+            raise Exception(upload_response.text)
+
+        public_url = f"{SUPABASE_URL}/storage/v1/object/public/creative-media/{file_path}"
+
+        print("Video uploaded:", public_url)
+
+        update_generation(
+            generation_id,
+            "completed",
+            public_url
+        )
+
+        return {
             "status": "completed",
-            "video_url": video_url,
-            "final_video_url": video_url
-        })
-
-        return {"success": True}
+            "video_url": public_url
+        }
 
     except Exception as e:
 
         print("ERROR:", str(e))
 
-        await update_generation(generation_id, {
-            "status": "failed"
-        })
+        update_generation(generation_id, "failed")
 
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
