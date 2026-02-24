@@ -1,6 +1,5 @@
 import os
 import json
-import time
 import base64
 import asyncio
 import httpx
@@ -12,7 +11,13 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 
 # =====================================================
-# CONFIG
+# INIT FASTAPI FIRST (CRITICAL)
+# =====================================================
+
+app = FastAPI()
+
+# =====================================================
+# ENV VARIABLES
 # =====================================================
 
 PROJECT_ID = os.environ["GOOGLE_CLOUD_PROJECT"]
@@ -24,19 +29,55 @@ SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"]
 
 # =====================================================
-# AUTH VIA SERVICE ACCOUNT JSON (ENV)
-# CALL VEO 3.1 VIA PREDICTLONGRUNNING
+# AUTH
+# =====================================================
+
+credentials_info = json.loads(SERVICE_ACCOUNT_JSON)
+
+credentials = service_account.Credentials.from_service_account_info(
+    credentials_info,
+    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+)
+
+credentials.refresh(Request())
+
+ACCESS_TOKEN = credentials.token
+
+# =====================================================
+# REQUEST MODEL
+# =====================================================
+
+class GenerateVideoRequest(BaseModel):
+    generation_id: str
+    image_url: str
+    prompt: str
+
+# =====================================================
+# DOWNLOAD IMAGE
+# =====================================================
+
+async def download_image_bytes(url: str):
+
+    async with httpx.AsyncClient(timeout=60) as client:
+
+        response = await client.get(url)
+
+        response.raise_for_status()
+
+        return response.content
+
+# =====================================================
+# CALL VEO USING PREDICT LONG RUNNING
 # =====================================================
 
 async def call_veo(image_bytes: bytes, prompt: str):
 
     endpoint = (
         f"https://{LOCATION}-aiplatform.googleapis.com/v1/"
-        f"projects/{PROJECT_ID}/locations/{LOCATION}/"
-        f"publishers/google/models/veo-3.1-generate-preview:predictLongRunning"
+        f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/veo-3.1-generate-preview:predictLongRunning"
     )
 
-    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+    image_base64 = base64.b64encode(image_bytes).decode()
 
     payload = {
         "instances": [
@@ -55,15 +96,11 @@ async def call_veo(image_bytes: bytes, prompt: str):
         "Content-Type": "application/json"
     }
 
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=600) as client:
 
         print("Calling Veo 3.1 via Vertex PredictLongRunning...")
 
-        response = await client.post(
-            endpoint,
-            headers=headers,
-            json=payload
-        )
+        response = await client.post(endpoint, headers=headers, json=payload)
 
         response.raise_for_status()
 
@@ -71,38 +108,32 @@ async def call_veo(image_bytes: bytes, prompt: str):
 
         operation_name = operation["name"]
 
-        # CORREÇÃO CRÍTICA: usar operation_name diretamente
-        poll_url = f"https://{LOCATION}-aiplatform.googleapis.com/v1/{operation_name}"
+        poll_url = (
+            f"https://{LOCATION}-aiplatform.googleapis.com/v1/{operation_name}"
+        )
 
-        print(f"Polling operation: {poll_url}")
+        print("Polling operation:", poll_url)
 
         while True:
 
-            poll = await client.get(
-                poll_url,
-                headers=headers
-            )
+            poll_response = await client.get(poll_url, headers=headers)
 
-            poll.raise_for_status()
+            poll_response.raise_for_status()
 
-            result = poll.json()
+            result = poll_response.json()
 
             if result.get("done"):
 
-                if "error" in result:
-
-                    raise Exception(result["error"])
-
                 video_uri = result["response"]["videos"][0]["uri"]
 
-                print(f"Video generated: {video_uri}")
+                print("Video generated:", video_uri)
 
                 return video_uri
 
             await asyncio.sleep(5)
 
 # =====================================================
-# SAVE TO SUPABASE
+# UPDATE SUPABASE
 # =====================================================
 
 async def update_supabase(generation_id: str, video_url: str):
@@ -124,16 +155,12 @@ async def update_supabase(generation_id: str, video_url: str):
 
     async with httpx.AsyncClient(timeout=60) as client:
 
-        response = await client.patch(
-            url,
-            headers=headers,
-            json=payload
-        )
+        response = await client.patch(url, headers=headers, json=payload)
 
         response.raise_for_status()
 
 # =====================================================
-# MAIN ENDPOINT
+# ENDPOINT
 # =====================================================
 
 @app.post("/generate-video")
@@ -141,22 +168,16 @@ async def generate_video(req: GenerateVideoRequest):
 
     try:
 
-        print(f"Starting Veo 3.1 generation: {req.generation_id}")
+        print("Starting Veo 3.1 generation:", req.generation_id)
 
         image_bytes = await download_image_bytes(req.image_url)
 
-        video_url = await call_veo(
-            image_bytes=image_bytes,
-            prompt=req.prompt
-        )
+        video_url = await call_veo(image_bytes, req.prompt)
 
-        await update_supabase(
-            generation_id=req.generation_id,
-            video_url=video_url
-        )
+        await update_supabase(req.generation_id, video_url)
 
         return {
-            "status": "completed",
+            "status": "success",
             "video_url": video_url
         }
 
@@ -165,6 +186,6 @@ async def generate_video(req: GenerateVideoRequest):
         print("ERROR:", str(e))
 
         return {
-            "status": "failed",
-            "error": str(e)
+            "status": "error",
+            "message": str(e)
         }
