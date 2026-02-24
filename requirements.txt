@@ -4,4 +4,4 @@ requests==2.32.5
 httpx==0.28.1
 
 google-cloud-aiplatform==1.71.1
-google-auth==2.48.0
+google-auth==2.29.0
