@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import asyncio
+import uuid
 import httpx
 
 from fastapi import FastAPI
@@ -68,7 +69,35 @@ async def download_image_bytes(url: str):
         return response.content
 
 # =====================================================
-# CALL VEO USING PREDICT LONG RUNNING (corrigido)
+# UPLOAD VIDEO TO SUPABASE STORAGE
+# =====================================================
+
+async def upload_video_to_supabase(video_bytes: bytes) -> str:
+
+    file_name = f"{uuid.uuid4()}.mp4"
+
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/videos/{file_name}"
+
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "video/mp4",
+    }
+
+    async with httpx.AsyncClient(timeout=120) as client:
+
+        response = await client.post(upload_url, headers=headers, content=video_bytes)
+
+        response.raise_for_status()
+
+    public_url = f"{SUPABASE_URL}/storage/v1/object/public/videos/{file_name}"
+
+    print("Video uploaded to Supabase Storage:", public_url)
+
+    return public_url
+
+# =====================================================
+# CALL VEO USING PREDICT LONG RUNNING
 # =====================================================
 
 async def call_veo(image_bytes: bytes, prompt: str):
@@ -98,9 +127,7 @@ async def call_veo(image_bytes: bytes, prompt: str):
                 }
             }
         ],
-        "parameters": {
-            "sampleCount": 1
-        }
+        "parameters": {"sampleCount": 1}
     }
 
     async with httpx.AsyncClient(timeout=600) as client:
@@ -131,8 +158,7 @@ async def call_veo(image_bytes: bytes, prompt: str):
             headers["Authorization"] = f"Bearer {token}"
 
             poll_response = await client.post(
-                fetch_url,
-                headers=headers,
+                fetch_url, headers=headers,
                 json={"operationName": operation_name}
             )
 
@@ -147,14 +173,22 @@ async def call_veo(image_bytes: bytes, prompt: str):
                 if not videos:
                     raise Exception("Nenhum video retornado: " + str(result))
 
-                video_uri = videos[0].get("gcsUri") or videos[0].get("uri")
+                video = videos[0]
 
-                if not video_uri:
-                    raise Exception("URI do video nao encontrado: " + str(videos[0]))
+                # Caso 1: URI no GCS ou URI direta
+                video_uri = video.get("gcsUri") or video.get("uri")
+                if video_uri:
+                    print("Video URI recebido:", video_uri)
+                    return video_uri
 
-                print("Video generated:", video_uri)
+                # Caso 2: Video retornado como bytes base64
+                video_b64 = video.get("bytesBase64Encoded")
+                if video_b64:
+                    print("Video retornado como bytes, fazendo upload para Supabase...")
+                    video_bytes_decoded = base64.b64decode(video_b64)
+                    return await upload_video_to_supabase(video_bytes_decoded)
 
-                return video_uri
+                raise Exception("Formato de video desconhecido: " + str(video))
 
             print("Still processing... waiting 10s")
 
