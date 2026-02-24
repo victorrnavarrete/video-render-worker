@@ -3,5 +3,5 @@ uvicorn
 requests
 python-multipart
 httpx
-google-cloud-aiplatform==1.71.1
+google-cloud-aiplatform==1.64.0
 google-auth
