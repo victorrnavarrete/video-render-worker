@@ -10,4 +10,4 @@ COPY main.py .
 
 EXPOSE 8080
 
-CMD ["sh", "-c", "printf '%s' \"$GOOGLE_APPLICATION_CREDENTIALS_JSON\" > /app/service-account.json && export GOOGLE_APPLICATION_CREDENTIALS=/app/service-account.json && ls -la /app && uvicorn main:app --host 0.0.0.0 --port 8080"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
