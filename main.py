@@ -100,7 +100,12 @@ async def call_veo(image_bytes: bytes, prompt: str):
         operation_name = operation["name"]
 
         # poll operation
-        poll_url = f"https://us-central1-aiplatform.googleapis.com/v1/{operation_name}"
+        operation_id = operation_name.split("/")[-1]
+
+operation_url = (
+    f"https://{LOCATION}-aiplatform.googleapis.com/v1/"
+    f"projects/{PROJECT_ID}/locations/{LOCATION}/operations/{operation_id}"
+)
 
         while True:
 
