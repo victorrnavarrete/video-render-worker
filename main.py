@@ -29,7 +29,7 @@ SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"]
 
 # =====================================================
-# AUTH
+# AUTH - dinamico (token renovado automaticamente)
 # =====================================================
 
 credentials_info = json.loads(SERVICE_ACCOUNT_JSON)
@@ -39,9 +39,10 @@ credentials = service_account.Credentials.from_service_account_info(
     scopes=["https://www.googleapis.com/auth/cloud-platform"],
 )
 
-credentials.refresh(Request())
-
-ACCESS_TOKEN = credentials.token
+def get_access_token() -> str:
+    if not credentials.valid:
+        credentials.refresh(Request())
+    return credentials.token
 
 # =====================================================
 # REQUEST MODEL
@@ -67,14 +68,22 @@ async def download_image_bytes(url: str):
         return response.content
 
 # =====================================================
-# CALL VEO USING PREDICT LONG RUNNING
+# CALL VEO USING PREDICT LONG RUNNING (corrigido)
 # =====================================================
 
 async def call_veo(image_bytes: bytes, prompt: str):
 
-    endpoint = (
+    token = get_access_token()
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    submit_url = (
         f"https://{LOCATION}-aiplatform.googleapis.com/v1/"
-        f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/veo-3.1-generate-preview:predictLongRunning"
+        f"projects/{PROJECT_ID}/locations/{LOCATION}/"
+        f"publishers/google/models/veo-3.1-generate-preview:predictLongRunning"
     )
 
     image_base64 = base64.b64encode(image_bytes).decode()
@@ -88,19 +97,17 @@ async def call_veo(image_bytes: bytes, prompt: str):
                     "mimeType": "image/jpeg"
                 }
             }
-        ]
-    }
-
-    headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Content-Type": "application/json"
+        ],
+        "parameters": {
+            "sampleCount": 1
+        }
     }
 
     async with httpx.AsyncClient(timeout=600) as client:
 
         print("Calling Veo 3.1 via Vertex PredictLongRunning...")
 
-        response = await client.post(endpoint, headers=headers, json=payload)
+        response = await client.post(submit_url, headers=headers, json=payload)
 
         response.raise_for_status()
 
@@ -108,15 +115,26 @@ async def call_veo(image_bytes: bytes, prompt: str):
 
         operation_name = operation["name"]
 
-        poll_url = (
-            f"https://{LOCATION}-aiplatform.googleapis.com/v1/{operation_name}"
+        print("Operation started:", operation_name)
+
+        fetch_url = (
+            f"https://{LOCATION}-aiplatform.googleapis.com/v1/"
+            f"projects/{PROJECT_ID}/locations/{LOCATION}/"
+            f"publishers/google/models/veo-3.1-generate-preview:fetchPredictOperation"
         )
 
-        print("Polling operation:", poll_url)
+        print("Polling via fetchPredictOperation...")
 
         while True:
 
-            poll_response = await client.get(poll_url, headers=headers)
+            token = get_access_token()
+            headers["Authorization"] = f"Bearer {token}"
+
+            poll_response = await client.post(
+                fetch_url,
+                headers=headers,
+                json={"operationName": operation_name}
+            )
 
             poll_response.raise_for_status()
 
@@ -124,13 +142,23 @@ async def call_veo(image_bytes: bytes, prompt: str):
 
             if result.get("done"):
 
-                video_uri = result["response"]["videos"][0]["uri"]
+                videos = result.get("response", {}).get("videos", [])
+
+                if not videos:
+                    raise Exception("Nenhum video retornado: " + str(result))
+
+                video_uri = videos[0].get("gcsUri") or videos[0].get("uri")
+
+                if not video_uri:
+                    raise Exception("URI do video nao encontrado: " + str(videos[0]))
 
                 print("Video generated:", video_uri)
 
                 return video_uri
 
-            await asyncio.sleep(5)
+            print("Still processing... waiting 10s")
+
+            await asyncio.sleep(10)
 
 # =====================================================
 # UPDATE SUPABASE
