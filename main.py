@@ -5,6 +5,7 @@ import asyncio
 import uuid
 import httpx
 
+from typing import Optional
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -53,6 +54,110 @@ class GenerateVideoRequest(BaseModel):
     generation_id: str
     image_url: str
     prompt: str
+    # Campos opcionais de metadados para enriquecer o prompt
+    emotion_type: Optional[str] = None
+    camera_mode: Optional[str] = None
+    body_motion_type: Optional[str] = None
+    eye_focus_type: Optional[str] = None
+    micro_expression_level: Optional[str] = None
+    background_motion_type: Optional[str] = None
+    head_movement_type: Optional[str] = None
+    behavior_type: Optional[str] = None
+    intent_type: Optional[str] = None
+    aspect_ratio: Optional[str] = None
+
+# =====================================================
+# BUILD VEO PROMPT (enriquece com metadados cinematicos)
+# =====================================================
+
+def build_veo_prompt(req: GenerateVideoRequest) -> str:
+
+    parts = [req.prompt]
+
+    camera_map = {
+        "tripod": "static tripod shot, stable camera",
+        "selfie": "handheld selfie-style shot, person holding phone",
+    }
+
+    body_map = {
+        "natural_shift": "subtle natural body movement",
+        "selfie_arm_movement": "arm holding phone with natural relaxed movement",
+        "presenting_product": "hands presenting product clearly to camera",
+    }
+
+    emotion_map = {
+        "confident": "confident and engaging expression",
+        "neutral": "natural relaxed expression",
+    }
+
+    eye_map = {
+        "camera_natural": "looking naturally and directly at camera",
+        "selfie_screen_focus": "looking at phone screen naturally",
+        "product_to_camera": "directing product toward camera with eye contact",
+    }
+
+    bg_map = {
+        "nature": "natural outdoor background with subtle ambient movement",
+        "none": "clean simple background, no distractions",
+    }
+
+    micro_map = {
+        "subtle_natural": "subtle natural micro-expressions, authentic feel",
+        "commercial": "polished commercial-quality expressions, professional look",
+    }
+
+    head_map = {
+        "natural": "natural slight head movement",
+        "selfie_style": "natural selfie-style head positioning",
+    }
+
+    intent_map = {
+        "casual_ugc": "casual user-generated content style, authentic and relatable",
+        "neutral": "natural conversational style",
+    }
+
+    if req.camera_mode and req.camera_mode in camera_map:
+        parts.append(camera_map[req.camera_mode])
+
+    if req.body_motion_type and req.body_motion_type in body_map:
+        parts.append(body_map[req.body_motion_type])
+
+    if req.emotion_type and req.emotion_type in emotion_map:
+        parts.append(emotion_map[req.emotion_type])
+
+    if req.eye_focus_type and req.eye_focus_type in eye_map:
+        parts.append(eye_map[req.eye_focus_type])
+
+    if req.background_motion_type and req.background_motion_type in bg_map:
+        parts.append(bg_map[req.background_motion_type])
+
+    if req.micro_expression_level and req.micro_expression_level in micro_map:
+        parts.append(micro_map[req.micro_expression_level])
+
+    if req.head_movement_type and req.head_movement_type in head_map:
+        parts.append(head_map[req.head_movement_type])
+
+    if req.intent_type and req.intent_type in intent_map:
+        parts.append(intent_map[req.intent_type])
+
+    # Qualidade base sempre aplicada
+    parts += [
+        "photorealistic",
+        "4K quality",
+        "sharp focus",
+        "smooth motion",
+        "no deformation",
+        "no morphing",
+        "anatomically correct",
+        "professional lighting",
+        "9:16 vertical video",
+    ]
+
+    enhanced = ". ".join(parts)
+
+    print("Enhanced prompt:", enhanced)
+
+    return enhanced
 
 # =====================================================
 # DOWNLOAD IMAGE
@@ -127,7 +232,15 @@ async def call_veo(image_bytes: bytes, prompt: str):
                 }
             }
         ],
-        "parameters": {"sampleCount": 1}
+        "parameters": {
+            "sampleCount": 1,
+            "aspectRatio": "9:16",
+            "negativePrompt": (
+                "deformation, morphing, distortion, blurry, low quality, "
+                "unrealistic, artifacts, glitch, flickering, watermark, text, "
+                "extra limbs, missing limbs, anatomical errors"
+            )
+        }
     }
 
     async with httpx.AsyncClient(timeout=600) as client:
@@ -234,7 +347,9 @@ async def generate_video(req: GenerateVideoRequest):
 
         image_bytes = await download_image_bytes(req.image_url)
 
-        video_url = await call_veo(image_bytes, req.prompt)
+        enhanced_prompt = build_veo_prompt(req)
+
+        video_url = await call_veo(image_bytes, enhanced_prompt)
 
         await update_supabase(req.generation_id, video_url)
 
