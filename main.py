@@ -1,16 +1,18 @@
 import os
+import json
 import time
 import base64
 import httpx
-from fastapi import FastAPI, HTTPException
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 
-app = FastAPI()
-
-# =========================
-# ENV VARS
-# =========================
+# =====================================================
+# CONFIG
+# =====================================================
 
 PROJECT_ID = os.environ["GOOGLE_CLOUD_PROJECT"]
 LOCATION = os.environ["GOOGLE_CLOUD_LOCATION"]
@@ -18,62 +20,57 @@ LOCATION = os.environ["GOOGLE_CLOUD_LOCATION"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-SERVICE_ACCOUNT_FILE = "/app/service-account.json"
+SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"]
 
-MODEL = "veo-3.1-generate-preview"
+# =====================================================
+# LOAD CREDENTIALS FROM ENV JSON (NOT FILE)
+# =====================================================
 
-# =========================
-# AUTH
-# =========================
+credentials_info = json.loads(SERVICE_ACCOUNT_JSON)
 
-credentials = service_account.Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_FILE,
+credentials = service_account.Credentials.from_service_account_info(
+    credentials_info,
     scopes=["https://www.googleapis.com/auth/cloud-platform"],
 )
 
-def get_access_token():
-    credentials.refresh(Request())
-    return credentials.token
+credentials.refresh(Request())
 
+ACCESS_TOKEN = credentials.token
 
-# =========================
-# SUPABASE REST
-# =========================
+# =====================================================
+# FASTAPI
+# =====================================================
 
-def update_generation(generation_id, data):
-    url = f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{generation_id}"
+app = FastAPI()
 
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal"
-    }
+# =====================================================
+# REQUEST MODEL
+# =====================================================
 
-    httpx.patch(url, headers=headers, json=data, timeout=60)
+class GenerateVideoRequest(BaseModel):
+    generation_id: str
+    image_url: str
+    prompt: str
 
-
-# =========================
+# =====================================================
 # DOWNLOAD IMAGE
-# =========================
+# =====================================================
 
-def download_image_bytes(image_url):
-    r = httpx.get(image_url, timeout=120)
-    r.raise_for_status()
-    return r.content
+async def download_image_bytes(url: str) -> bytes:
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        return response.content
 
+# =====================================================
+# CALL VERTEX PREDICT LONG RUNNING
+# =====================================================
 
-# =========================
-# START VEO JOB
-# =========================
+async def call_veo(image_bytes: bytes, prompt: str):
 
-def start_veo_job(image_bytes, prompt):
+    endpoint = f"https://us-central1-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/us-central1/publishers/google/models/veo-3.1-generate-preview:predictLongRunning"
 
-    token = get_access_token()
-
-    url = f"https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL}:predictLongRunning"
-
-    image_base64 = base64.b64encode(image_bytes).decode()
+    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
     payload = {
         "instances": [
@@ -88,146 +85,93 @@ def start_veo_job(image_bytes, prompt):
     }
 
     headers = {
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
         "Content-Type": "application/json"
     }
 
-    response = httpx.post(url, headers=headers, json=payload, timeout=120)
+    async with httpx.AsyncClient(timeout=300) as client:
 
-    if response.status_code != 200:
-        raise Exception(response.text)
+        response = await client.post(endpoint, headers=headers, json=payload)
 
-    operation = response.json()
+        response.raise_for_status()
 
-    return operation["name"]
+        operation = response.json()
 
+        operation_name = operation["name"]
 
-# =========================
-# POLL OPERATION
-# =========================
+        # poll operation
+        poll_url = f"https://us-central1-aiplatform.googleapis.com/v1/{operation_name}"
 
-def poll_operation(operation_name):
+        while True:
 
-    token = get_access_token()
+            poll = await client.get(poll_url, headers=headers)
 
-    url = f"https://{LOCATION}-aiplatform.googleapis.com/v1/{operation_name}"
+            poll.raise_for_status()
 
-    headers = {
-        "Authorization": f"Bearer {token}"
-    }
+            result = poll.json()
 
-    while True:
+            if result.get("done"):
 
-        response = httpx.get(url, headers=headers, timeout=60)
+                video_uri = result["response"]["videos"][0]["uri"]
 
-        if response.status_code != 200:
-            raise Exception(response.text)
+                return video_uri
 
-        data = response.json()
+            await asyncio.sleep(5)
 
-        if data.get("done"):
+# =====================================================
+# SAVE TO SUPABASE
+# =====================================================
 
-            if "error" in data:
-                raise Exception(data["error"])
+async def update_supabase(generation_id: str, video_url: str):
 
-            video_uri = data["response"]["predictions"][0]["video"]["uri"]
-
-            return video_uri
-
-        time.sleep(10)
-
-
-# =========================
-# DOWNLOAD VIDEO
-# =========================
-
-def download_video(video_uri):
-
-    token = get_access_token()
-
-    headers = {
-        "Authorization": f"Bearer {token}"
-    }
-
-    response = httpx.get(video_uri, headers=headers, timeout=600)
-
-    response.raise_for_status()
-
-    return response.content
-
-
-# =========================
-# UPLOAD VIDEO TO SUPABASE STORAGE
-# =========================
-
-def upload_to_supabase(generation_id, video_bytes):
-
-    path = f"videos/{generation_id}.mp4"
-
-    url = f"{SUPABASE_URL}/storage/v1/object/video-generations/{path}"
+    url = f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{generation_id}"
 
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "video/mp4"
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
     }
 
-    httpx.post(url, headers=headers, content=video_bytes, timeout=600)
+    payload = {
+        "status": "completed",
+        "video_url": video_url,
+        "final_video_url": video_url
+    }
 
-    public_url = f"{SUPABASE_URL}/storage/v1/object/public/video-generations/{path}"
+    async with httpx.AsyncClient(timeout=60) as client:
 
-    return public_url
+        response = await client.patch(url, headers=headers, json=payload)
 
+        response.raise_for_status()
 
-# =========================
-# MAIN ENDPOINT
-# =========================
+# =====================================================
+# ENDPOINT
+# =====================================================
 
 @app.post("/generate-video")
-async def generate_video(body: dict):
+async def generate_video(req: GenerateVideoRequest):
 
     try:
 
-        generation_id = body["generation_id"]
-        image_url = body["image_url"]
-        prompt = body.get("prompt", "cinematic realistic motion")
+        print(f"Starting Veo 3.1 generation: {req.generation_id}")
 
-        print("Starting Veo 3.1 generation:", generation_id)
+        image_bytes = await download_image_bytes(req.image_url)
 
-        update_generation(generation_id, {
-            "status": "processing"
-        })
+        video_url = await call_veo(image_bytes, req.prompt)
 
-        print("Downloading image...")
-        image_bytes = download_image_bytes(image_url)
+        await update_supabase(req.generation_id, video_url)
 
-        print("Calling Veo 3.1 via Vertex AI...")
-        operation_name = start_veo_job(image_bytes, prompt)
-
-        print("Polling operation...")
-        video_uri = poll_operation(operation_name)
-
-        print("Downloading video...")
-        video_bytes = download_video(video_uri)
-
-        print("Uploading to Supabase Storage...")
-        video_url = upload_to_supabase(generation_id, video_bytes)
-
-        print("Saving URL...")
-        update_generation(generation_id, {
-            "status": "completed",
-            "video_url": video_url,
-            "final_video_url": video_url
-        })
-
-        return {"success": True, "video_url": video_url}
+        return {
+            "status": "success",
+            "video_url": video_url
+        }
 
     except Exception as e:
 
         print("ERROR:", str(e))
 
-        update_generation(body["generation_id"], {
-            "status": "failed"
-        })
-
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "status": "error",
+            "message": str(e)
+        }
