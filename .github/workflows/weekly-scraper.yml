@@ -1,0 +1,31 @@
+name: Weekly TikTok Scraper
+
+on:
+  schedule:
+    # Every Monday at 7:00 AM UTC (4:00 AM BRT)
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+    # Allow manual trigger from GitHub Actions UI
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Trigger scrape-trending endpoint
+        run: |
+          response=$(curl -s -o /tmp/response.json -w "%{http_code}" \
+            -X POST \
+            -H "X-Scraper-Secret: ${{ secrets.SCRAPER_SECRET }}" \
+            -H "Content-Type: application/json" \
+            https://video-render-worker-production.up.railway.app/scrape-trending)
+
+          echo "HTTP Status: $response"
+          echo "Response body:"
+          cat /tmp/response.json
+
+          if [ "$response" != "200" ]; then
+            echo "Error: Expected 200, got $response"
+            exit 1
+          fi
