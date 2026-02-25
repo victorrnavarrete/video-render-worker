@@ -71,13 +71,13 @@ class GenerateVideoRequest(BaseModel):
 
 class ClipConfig(BaseModel):
     url: str
-    trim_start: Optional[float] = 0.0   # segundos a cortar no inicio
-    trim_end: Optional[float] = None     # segundos a cortar no fim (None = sem corte)
+    trim_start: Optional[float] = 0.0
+    trim_end: Optional[float] = None
 
 class MergeVideosRequest(BaseModel):
     sequence_id: str
-    video_urls: Optional[List[str]] = None   # retrocompatibilidade
-    clips: Optional[List[ClipConfig]] = None # novo: com info de trim por cena
+    video_urls: Optional[List[str]] = None
+    clips: Optional[List[ClipConfig]] = None
 
 # =====================================================
 # BUILD VEO PROMPT (enriquece com metadados cinematicos)
@@ -192,19 +192,16 @@ async def download_image_bytes(url: str):
 def crop_image_to_ratio(image_bytes: bytes, target_ratio: str = "9:16") -> bytes:
     """
     Crop image to target aspect ratio using center crop.
-    This ensures Veo generates video in the correct ratio,
-    since image-to-video mode uses the source image dimensions.
+    Veo image-to-video mode uses source image dimensions,
+    so we must pre-process to ensure correct output ratio.
     """
     try:
         w_ratio, h_ratio = map(int, target_ratio.split(":"))
-        target_aspect = w_ratio / h_ratio  # e.g. 9/16 = 0.5625 for portrait
+        target_aspect = w_ratio / h_ratio
 
         img = Image.open(io.BytesIO(image_bytes))
 
-        # Convert to RGB if needed
-        if img.mode not in ("RGB", "RGBA"):
-            img = img.convert("RGB")
-        if img.mode == "RGBA":
+        if img.mode not in ("RGB",):
             img = img.convert("RGB")
 
         orig_w, orig_h = img.size
@@ -219,23 +216,20 @@ def crop_image_to_ratio(image_bytes: bytes, target_ratio: str = "9:16") -> bytes
             return output.getvalue()
 
         if current_aspect > target_aspect:
-            # Image is too wide -> crop width (keep full height)
             new_w = int(orig_h * target_aspect)
             left = (orig_w - new_w) // 2
             img = img.crop((left, 0, left + new_w, orig_h))
             print(f"Cropped width: {orig_w} -> {new_w} (left={left})")
         else:
-            # Image is too tall -> crop height (keep full width)
             new_h = int(orig_w / target_aspect)
-            top = (orig_h - new_h) // 4  # slightly above center (face usually in upper half)
+            top = (orig_h - new_h) // 4
             img = img.crop((0, top, orig_w, top + new_h))
             print(f"Cropped height: {orig_h} -> {new_h} (top={top})")
 
         output = io.BytesIO()
         img.save(output, format="JPEG", quality=95)
-        cropped_bytes = output.getvalue()
-        print(f"Image cropped successfully: {len(image_bytes)} -> {len(cropped_bytes)} bytes")
-        return cropped_bytes
+        print(f"Image cropped: {len(image_bytes)} -> {len(output.getvalue())} bytes")
+        return output.getvalue()
 
     except Exception as e:
         print(f"Image crop warning (using original): {e}")
@@ -269,6 +263,51 @@ async def upload_video_to_supabase(video_bytes: bytes, file_name: str = None) ->
         print("Video uploaded to Supabase Storage:", public_url)
 
         return public_url
+
+# =====================================================
+# PARSE VEO ERROR (transforma erros tecnicos em mensagens amigaveis)
+# =====================================================
+
+def parse_veo_error(raw_error: str) -> str:
+    err = str(raw_error).lower()
+
+    if "third-party content providers" in err or "35561574" in err:
+        return (
+            "O prompt foi recusado pelo modelo de IA por conter referencias a "
+            "marcas, musicas, celebridades ou conteudo protegido. "
+            "Tente reformular o script removendo nomes especificos."
+        )
+
+    if "safety" in err or "content_filter" in err or "blocked" in err:
+        return (
+            "O conteudo foi bloqueado pelas politicas de seguranca da IA. "
+            "Revise o prompt e tente novamente."
+        )
+
+    if "quota" in err or "resource_exhausted" in err:
+        return (
+            "Limite de uso da API atingido. Aguarde alguns minutos e tente novamente."
+        )
+
+    if "invalid_argument" in err or "code: 3" in err:
+        return (
+            "Parametros invalidos enviados para o modelo. "
+            "Verifique o prompt e tente novamente."
+        )
+
+    if "deadline_exceeded" in err or "timeout" in err:
+        return (
+            "A geracao do video demorou muito e foi interrompida. "
+            "Tente novamente."
+        )
+
+    if "unavailable" in err or "503" in err:
+        return (
+            "O servico de geracao de video esta temporariamente indisponivel. "
+            "Tente novamente em alguns minutos."
+        )
+
+    return f"Erro na geracao: {str(raw_error)[:300]}"
 
 # =====================================================
 # CALL VEO USING PREDICT LONG RUNNING
@@ -347,6 +386,10 @@ async def call_veo(image_bytes: bytes, prompt: str, aspect_ratio: str = "9:16"):
 
             if result.get("done"):
 
+                # Checa erro retornado pelo Veo (content policy, etc.)
+                if result.get("error"):
+                    raise Exception(str(result))
+
                 videos = result.get("response", {}).get("videos", [])
 
                 if not videos:
@@ -372,7 +415,7 @@ async def call_veo(image_bytes: bytes, prompt: str, aspect_ratio: str = "9:16"):
             await asyncio.sleep(10)
 
 # =====================================================
-# UPDATE SUPABASE
+# UPDATE SUPABASE - sucesso
 # =====================================================
 
 async def update_supabase(generation_id: str, video_url: str):
@@ -399,6 +442,37 @@ async def update_supabase(generation_id: str, video_url: str):
         response.raise_for_status()
 
 # =====================================================
+# UPDATE SUPABASE - falha
+# =====================================================
+
+async def update_supabase_failed(generation_id: str, error_message: str):
+    """
+    Atualiza a cena como 'failed' com mensagem de erro amigavel.
+    Sem isso, cenas com erro ficam presas em 'processing_worker' para sempre.
+    """
+    url = f"{SUPABASE_URL}/rest/v1/video_generations?id=eq.{generation_id}"
+
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
+    }
+
+    payload = {
+        "status": "failed",
+        "error_message": error_message[:1000]
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.patch(url, headers=headers, json=payload)
+            response.raise_for_status()
+            print(f"Supabase updated: generation {generation_id} -> failed")
+    except Exception as e:
+        print(f"Warning: could not update failed status in Supabase: {e}")
+
+# =====================================================
 # ENDPOINT: GENERATE SINGLE VIDEO
 # =====================================================
 
@@ -413,8 +487,6 @@ async def generate_video(req: GenerateVideoRequest):
 
         image_bytes = await download_image_bytes(req.image_url)
 
-        # Pre-processa imagem para o aspect ratio correto
-        # (Veo image-to-video usa as dimensoes da imagem de entrada)
         image_bytes = crop_image_to_ratio(image_bytes, aspect)
 
         enhanced_prompt = build_veo_prompt(req)
@@ -427,9 +499,14 @@ async def generate_video(req: GenerateVideoRequest):
 
     except Exception as e:
 
-        print("ERROR:", str(e))
+        raw_error = str(e)
+        print("ERROR:", raw_error)
 
-        return {"status": "error", "message": str(e)}
+        friendly_error = parse_veo_error(raw_error)
+
+        await update_supabase_failed(req.generation_id, friendly_error)
+
+        return {"status": "error", "message": friendly_error}
 
 # =====================================================
 # ENDPOINT: MERGE VIDEOS (com suporte a trim por cena)
@@ -440,19 +517,17 @@ async def merge_videos(req: MergeVideosRequest):
 
     try:
 
-        # Normaliza: aceita 'clips' (novo) ou 'video_urls' (retrocompatibilidade)
         if req.clips:
             clip_list = req.clips
         elif req.video_urls:
             clip_list = [ClipConfig(url=u) for u in req.video_urls]
         else:
-            return {"status": "error", "message": "Forneça 'clips' ou 'video_urls'"}
+            return {"status": "error", "message": "Forneca 'clips' ou 'video_urls'"}
 
         print(f"Starting merge for sequence: {req.sequence_id} | {len(clip_list)} clips")
 
         with tempfile.TemporaryDirectory() as tmpdir:
 
-            # 1. Download e trim de cada clip
             trimmed_paths = []
 
             async with httpx.AsyncClient(timeout=120) as client:
@@ -470,7 +545,6 @@ async def merge_videos(req: MergeVideosRequest):
                     with open(raw_path, "wb") as f:
                         f.write(response.content)
 
-                    # Aplica trim se necessario
                     trim_start = clip.trim_start or 0.0
                     needs_trim = trim_start > 0 or clip.trim_end is not None
 
@@ -482,8 +556,6 @@ async def merge_videos(req: MergeVideosRequest):
                             ffmpeg_cmd += ["-ss", str(trim_start)]
 
                         if clip.trim_end is not None:
-                            # trim_end = segundos a cortar do fim
-                            # Pega a duracao total via ffprobe
                             probe = subprocess.run(
                                 ["ffprobe", "-v", "error",
                                  "-show_entries", "format=duration",
@@ -501,7 +573,7 @@ async def merge_videos(req: MergeVideosRequest):
 
                         if result.returncode != 0:
                             print(f"Trim warning clip {i}: {result.stderr}")
-                            trimmed_path = raw_path  # fallback: usa original
+                            trimmed_path = raw_path
                         else:
                             print(f"Clip {i + 1} trimmed: start={trim_start}s, trim_end={clip.trim_end}s")
                     else:
@@ -509,14 +581,12 @@ async def merge_videos(req: MergeVideosRequest):
 
                     trimmed_paths.append(trimmed_path)
 
-            # 2. Cria arquivo de lista para FFmpeg concat
             concat_file = os.path.join(tmpdir, "concat.txt")
 
             with open(concat_file, "w") as f:
                 for path in trimmed_paths:
                     f.write(f"file '{path}'\n")
 
-            # 3. Concatena todos os clips
             output_path = os.path.join(tmpdir, "merged.mp4")
 
             result = subprocess.run(
@@ -530,7 +600,6 @@ async def merge_videos(req: MergeVideosRequest):
 
             print("FFmpeg merge completed successfully")
 
-            # 4. Upload do video final
             with open(output_path, "rb") as f:
                 merged_bytes = f.read()
 
