@@ -10,7 +10,7 @@ import httpx
 
 from PIL import Image
 from typing import Optional, List
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 
 from google.oauth2 import service_account
@@ -613,4 +613,27 @@ async def merge_videos(req: MergeVideosRequest):
 
         print(f"ERROR in merge: {str(e)}")
 
+        return {"status": "error", "message": str(e)}
+
+    
+
+# =====================================================
+# ENV: SCRAPER SECRET
+# =====================================================
+SCRAPER_SECRET = os.environ.get("SCRAPER_SECRET", "")
+
+
+# =====================================================
+# ENDPOINT: SCRAPE TRENDING (TikTok Creative Center)
+# =====================================================
+@app.post("/scrape-trending")
+async def scrape_trending(request: Request):
+    secret = request.headers.get("X-Scraper-Secret", "")
+    if SCRAPER_SECRET and secret != SCRAPER_SECRET:
+        return {"status": "error", "message": "Unauthorized"}
+    try:
+        from scraper import run_scraper
+        result = await run_scraper()
+        return result
+    except Exception as e:
         return {"status": "error", "message": str(e)}
