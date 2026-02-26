@@ -8,7 +8,7 @@ import tempfile
 import io
 import httpx
 
-from PIL import Imageh
+from PIL import Image
 from typing import Optional, List
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
