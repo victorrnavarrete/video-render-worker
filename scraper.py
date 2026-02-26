@@ -142,6 +142,9 @@ async def scrape_tiktok_creative_center() -> list:
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-web-security",
+                "--ignore-certificate-errors",
             ],
         )
         context = await browser.new_context(
@@ -154,6 +157,14 @@ async def scrape_tiktok_creative_center() -> list:
             viewport={"width": 1280, "height": 800},
         )
         page = await context.new_page()
+        # Ocultar fingerprints de automacao
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR', 'pt', 'en-US'] });
+            window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+        """)
 
         async def handle_response(response):
             if API_PATTERN in response.url and "list" in response.url:
@@ -182,9 +193,23 @@ async def scrape_tiktok_creative_center() -> list:
         await page.wait_for_timeout(5000)
 
         if not captured_materials:
-            print("[scraper] Tentando scroll para forcar carregamento...")
-            await page.evaluate("window.scrollTo(0, 500)")
+            print("[scraper] Tentando scroll e interacao para forcar carregamento...")
+            await page.evaluate("window.scrollTo(0, 300)")
+            await page.wait_for_timeout(4000)
+            await page.evaluate("window.scrollTo(0, 800)")
             await page.wait_for_timeout(3000)
+            # Tentar URL alternativa sem /inspiration/
+            if not captured_materials:
+                alt_url = (
+                    "https://ads.tiktok.com/business/creativecenter/topads/pc/en"
+                    "?period=7&region=BR&secondIndustry=14104000000"
+                )
+                print(f"[scraper] Tentando URL alternativa: {alt_url}")
+                try:
+                    await page.goto(alt_url, wait_until="networkidle", timeout=60000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(8000)
 
         await browser.close()
 
