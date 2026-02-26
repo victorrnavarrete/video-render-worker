@@ -8,13 +8,13 @@ import tempfile
 import io
 import httpx
 
-from PIL import Image
+from PIL import Imageh
 from typing import Optional, List
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 
 from google.oauth2 import service_account
-from google.auth.transport.requests import Request
+from google.auth.transport.requests import Request as GoogleRequest
 
 # =====================================================
 # INIT FASTAPI FIRST (CRITICAL)
@@ -47,7 +47,7 @@ credentials = service_account.Credentials.from_service_account_info(
 
 def get_access_token() -> str:
     if not credentials.valid:
-        credentials.refresh(Request())
+        credentials.refresh(GoogleRequest())
     return credentials.token
 
 # =====================================================
