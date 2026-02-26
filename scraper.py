@@ -129,11 +129,11 @@ async def upsert_trending_video(item: dict, week_of: date, rank: int):
 # ─────────────────────────────────────────────
 async def scrape_tiktok_creative_center() -> list:
     """
-    Abre TikTok Creative Center via Playwright e intercepta
-    a resposta da API interna top_ads/v2/list para cosmeticos.
+    Abre TikTok Creative Center via Playwright, aguarda carregamento do SDK
+    do TikTok e usa page.evaluate() para chamar a API interna a partir do
+    contexto JS da pagina, aproveitando cookies e autenticacao automaticamente.
+    Fallback: interceptacao de resposta de rede.
     """
-    captured_materials = []
-
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -144,7 +144,6 @@ async def scrape_tiktok_creative_center() -> list:
                 "--disable-gpu",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-web-security",
-                "--ignore-certificate-errors",
             ],
         )
         context = await browser.new_context(
@@ -157,7 +156,8 @@ async def scrape_tiktok_creative_center() -> list:
             viewport={"width": 1280, "height": 800},
         )
         page = await context.new_page()
-        # Ocultar fingerprints de automacao
+
+        # Hide automation fingerprints
         await page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
@@ -166,56 +166,93 @@ async def scrape_tiktok_creative_center() -> list:
             Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
         """)
 
+        # --- Strategy 1: page.evaluate() inside page JS context ---
+        # This uses the page's own cookies + TikTok SDK for auth automatically
+        print("[scraper] Navegando para TikTok Creative Center...")
+        try:
+            await page.goto(TIKTOK_CC_URL, wait_until="networkidle", timeout=60000)
+        except Exception as e:
+            print(f"[scraper] Timeout na navegacao (continuando): {e}")
+
+        await page.wait_for_timeout(5000)
+
+        print("[scraper] Tentando page.evaluate() para chamar API interna...")
+        try:
+            result = await page.evaluate("""
+                async () => {
+                    const apiPath = '/creative_radar_api/v1/top_ads/v2/list'
+                        + '?period=7&industry=14104000000&page=1&limit=20'
+                        + '&order_by=for_you&country_code=BR';
+                    const headers = { 'Accept': 'application/json' };
+
+                    // Use TikTok SDK signature if available
+                    if (window.byted_acrawler &&
+                            typeof byted_acrawler.frontierSign === 'function') {
+                        try {
+                            const signed = byted_acrawler.frontierSign(apiPath);
+                            if (signed && signed['X-Bogus']) {
+                                headers['X-Bogus'] = signed['X-Bogus'];
+                            }
+                        } catch(e) {}
+                    }
+
+                    const resp = await fetch('https://ads.tiktok.com' + apiPath, {
+                        credentials: 'include',
+                        headers,
+                    });
+                    return await resp.json();
+                }
+            """)
+            materials = (
+                result.get("data", {}).get("materials")
+                or result.get("data", {}).get("list")
+                or result.get("data", {}).get("ad_list")
+                or []
+            )
+            code = result.get("code")
+            print(f"[scraper] page.evaluate() retornou code={code}, {len(materials)} ads")
+            if materials:
+                await browser.close()
+                return materials[:MAX_ADS]
+        except Exception as e:
+            print(f"[scraper] page.evaluate() falhou: {e}")
+
+        # --- Strategy 2: response interception (fallback) ---
+        print("[scraper] Fallback: interceptacao de resposta de rede...")
+        captured_materials = []
+
         async def handle_response(response):
             if API_PATTERN in response.url and "list" in response.url:
                 try:
                     body = await response.json()
-                    materials = (
+                    mats = (
                         body.get("data", {}).get("materials")
                         or body.get("data", {}).get("list")
                         or body.get("data", {}).get("ad_list")
                         or []
                     )
-                    if materials:
-                        print(f"[scraper] Capturado: {len(materials)} ads")
-                        captured_materials.extend(materials)
+                    if mats:
+                        print(f"[scraper] Interceptacao: {len(mats)} ads")
+                        captured_materials.extend(mats)
                 except Exception as e:
                     print(f"[scraper] Aviso ao parsear resposta: {e}")
 
         page.on("response", handle_response)
 
-        print("[scraper] Navegando para TikTok Creative Center...")
+        # Trigger fresh API call by loading with period=30
         try:
-            await page.goto(TIKTOK_CC_URL, wait_until="networkidle", timeout=60000)
-        except Exception as e:
-            print(f"[scraper] Timeout/erro na navegacao (pode ser ok): {e}")
-
-        await page.wait_for_timeout(5000)
-
-        if not captured_materials:
-            print("[scraper] Tentando scroll e interacao para forcar carregamento...")
-            await page.evaluate("window.scrollTo(0, 300)")
-            await page.wait_for_timeout(4000)
-            await page.evaluate("window.scrollTo(0, 800)")
-            await page.wait_for_timeout(3000)
-            # Tentar URL alternativa sem /inspiration/
-            if not captured_materials:
-                alt_url = (
-                    "https://ads.tiktok.com/business/creativecenter/topads/pc/en"
-                    "?period=7&region=BR&secondIndustry=14104000000"
-                )
-                print(f"[scraper] Tentando URL alternativa: {alt_url}")
-                try:
-                    await page.goto(alt_url, wait_until="networkidle", timeout=60000)
-                except Exception:
-                    pass
-                await page.wait_for_timeout(8000)
+            await page.goto(
+                TIKTOK_CC_URL.replace("period=7", "period=30"),
+                wait_until="networkidle",
+                timeout=60000,
+            )
+        except Exception:
+            pass
+        await page.wait_for_timeout(8000)
 
         await browser.close()
-
-    print(f"[scraper] Total capturado: {len(captured_materials)} ads")
-    return captured_materials[:MAX_ADS]
-
+        print(f"[scraper] Total capturado (fallback): {len(captured_materials)} ads")
+        return captured_materials[:MAX_ADS]
 
 # ─────────────────────────────────────────────
 # MAIN SCRAPER FUNCTION
