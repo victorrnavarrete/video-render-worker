@@ -58,6 +58,7 @@ class GenerateVideoRequest(BaseModel):
     generation_id: str
     image_url: str
     prompt: str
+    script_text: Optional[str] = None
     emotion_type: Optional[str] = None
     camera_mode: Optional[str] = None
     body_motion_type: Optional[str] = None
@@ -68,6 +69,9 @@ class GenerateVideoRequest(BaseModel):
     behavior_type: Optional[str] = None
     intent_type: Optional[str] = None
     aspect_ratio: Optional[str] = None
+    duration: Optional[int] = None
+    video_quality: Optional[str] = None
+    model: Optional[str] = None
 
 class ClipConfig(BaseModel):
     url: str
@@ -84,90 +88,22 @@ class MergeVideosRequest(BaseModel):
 # =====================================================
 
 def build_veo_prompt(req: GenerateVideoRequest) -> str:
+    """
+    The edge functions already build a comprehensive, structured prompt with
+    all behavioral descriptions (camera, body, emotion, etc.) included.
+    We use it directly and only append quality keywords.
+    """
+    aspect = req.aspect_ratio or "9:16"
 
-    parts = [req.prompt]
+    quality_suffix = (
+        f"photorealistic. 4K quality. sharp focus. smooth motion. "
+        f"no deformation. no morphing. anatomically correct. "
+        f"professional lighting. {aspect} video"
+    )
 
-    camera_map = {
-        "tripod": "static tripod shot, stable camera",
-        "selfie": "handheld selfie-style shot, person holding phone",
-    }
+    enhanced = req.prompt + "\n\n" + quality_suffix
 
-    body_map = {
-        "natural_shift": "subtle natural body movement",
-        "selfie_arm_movement": "arm holding phone with natural relaxed movement",
-        "presenting_product": "hands presenting product clearly to camera",
-    }
-
-    emotion_map = {
-        "confident": "confident and engaging expression",
-        "neutral": "natural relaxed expression",
-    }
-
-    eye_map = {
-        "camera_natural": "looking naturally and directly at camera",
-        "selfie_screen_focus": "looking at phone screen naturally",
-        "product_to_camera": "directing product toward camera with eye contact",
-    }
-
-    bg_map = {
-        "nature": "natural outdoor background with subtle ambient movement",
-        "none": "clean simple background, no distractions",
-    }
-
-    micro_map = {
-        "subtle_natural": "subtle natural micro-expressions, authentic feel",
-        "commercial": "polished commercial-quality expressions, professional look",
-    }
-
-    head_map = {
-        "natural": "natural slight head movement",
-        "selfie_style": "natural selfie-style head positioning",
-    }
-
-    intent_map = {
-        "casual_ugc": "casual user-generated content style, authentic and relatable",
-        "neutral": "natural conversational style",
-    }
-
-    if req.camera_mode and req.camera_mode in camera_map:
-        parts.append(camera_map[req.camera_mode])
-
-    if req.body_motion_type and req.body_motion_type in body_map:
-        parts.append(body_map[req.body_motion_type])
-
-    if req.emotion_type and req.emotion_type in emotion_map:
-        parts.append(emotion_map[req.emotion_type])
-
-    if req.eye_focus_type and req.eye_focus_type in eye_map:
-        parts.append(eye_map[req.eye_focus_type])
-
-    if req.background_motion_type and req.background_motion_type in bg_map:
-        parts.append(bg_map[req.background_motion_type])
-
-    if req.micro_expression_level and req.micro_expression_level in micro_map:
-        parts.append(micro_map[req.micro_expression_level])
-
-    if req.head_movement_type and req.head_movement_type in head_map:
-        parts.append(head_map[req.head_movement_type])
-
-    if req.intent_type and req.intent_type in intent_map:
-        parts.append(intent_map[req.intent_type])
-
-    parts += [
-        "photorealistic",
-        "4K quality",
-        "sharp focus",
-        "smooth motion",
-        "no deformation",
-        "no morphing",
-        "anatomically correct",
-        "professional lighting",
-        "9:16 vertical video",
-    ]
-
-    enhanced = ". ".join(parts)
-
-    print("Enhanced prompt:", enhanced)
+    print(f"Final prompt ({len(enhanced)} chars):", enhanced[:500])
 
     return enhanced
 
@@ -313,7 +249,13 @@ def parse_veo_error(raw_error: str) -> str:
 # CALL VEO USING PREDICT LONG RUNNING
 # =====================================================
 
-async def call_veo(image_bytes: bytes, prompt: str, aspect_ratio: str = "9:16"):
+async def call_veo(
+    image_bytes: bytes,
+    prompt: str,
+    aspect_ratio: str = "9:16",
+    duration_seconds: int = 8,
+    model: str = "veo-3.1-generate-preview",
+):
 
     token = get_access_token()
 
@@ -325,10 +267,14 @@ async def call_veo(image_bytes: bytes, prompt: str, aspect_ratio: str = "9:16"):
     submit_url = (
         f"https://{LOCATION}-aiplatform.googleapis.com/v1/"
         f"projects/{PROJECT_ID}/locations/{LOCATION}/"
-        f"publishers/google/models/veo-3.1-generate-preview:predictLongRunning"
+        f"publishers/google/models/{model}:predictLongRunning"
     )
 
     image_base64 = base64.b64encode(image_bytes).decode()
+
+    # Clamp duration to Veo3 valid values (4, 6, 8)
+    valid_durations = [4, 6, 8]
+    clamped_duration = min(valid_durations, key=lambda d: abs(d - duration_seconds))
 
     payload = {
         "instances": [
@@ -340,13 +286,17 @@ async def call_veo(image_bytes: bytes, prompt: str, aspect_ratio: str = "9:16"):
         "parameters": {
             "sampleCount": 1,
             "aspectRatio": aspect_ratio,
+            "durationSeconds": clamped_duration,
             "negativePrompt": (
                 "deformation, morphing, distortion, blurry, low quality, "
                 "unrealistic, artifacts, glitch, flickering, watermark, text, "
-                "extra limbs, missing limbs, anatomical errors"
+                "extra limbs, missing limbs, anatomical errors, "
+                "subtitle, caption, on-screen text, logo"
             )
         }
     }
+
+    print(f"Veo params: model={model}, duration={clamped_duration}s, aspect={aspect_ratio}")
 
     async with httpx.AsyncClient(timeout=600) as client:
 
@@ -365,7 +315,7 @@ async def call_veo(image_bytes: bytes, prompt: str, aspect_ratio: str = "9:16"):
         fetch_url = (
             f"https://{LOCATION}-aiplatform.googleapis.com/v1/"
             f"projects/{PROJECT_ID}/locations/{LOCATION}/"
-            f"publishers/google/models/veo-3.1-generate-preview:fetchPredictOperation"
+            f"publishers/google/models/{model}:fetchPredictOperation"
         )
 
         print("Polling via fetchPredictOperation...")
@@ -481,7 +431,10 @@ async def generate_video(req: GenerateVideoRequest):
 
     try:
 
-        print("Starting Veo 3.1 generation:", req.generation_id)
+        veo_model = req.model or "veo-3.1-generate-preview"
+        duration = req.duration or 8
+
+        print(f"Starting Veo generation: {req.generation_id} | model={veo_model} | duration={duration}s")
 
         aspect = req.aspect_ratio or "9:16"
 
@@ -491,7 +444,13 @@ async def generate_video(req: GenerateVideoRequest):
 
         enhanced_prompt = build_veo_prompt(req)
 
-        video_url = await call_veo(image_bytes, enhanced_prompt, aspect_ratio=aspect)
+        video_url = await call_veo(
+            image_bytes,
+            enhanced_prompt,
+            aspect_ratio=aspect,
+            duration_seconds=duration,
+            model=veo_model,
+        )
 
         await update_supabase(req.generation_id, video_url)
 
