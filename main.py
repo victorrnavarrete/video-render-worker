@@ -291,7 +291,8 @@ async def call_veo(
                 "deformation, morphing, distortion, blurry, low quality, "
                 "unrealistic, artifacts, glitch, flickering, watermark, text, "
                 "extra limbs, missing limbs, anatomical errors, "
-                "subtitle, caption, on-screen text, logo"
+                "subtitle, caption, on-screen text, logo, "
+                "bokeh, shallow depth of field, blurry background, out of focus background"
             )
         }
     }
