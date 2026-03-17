@@ -13,6 +13,7 @@ from typing import Optional, List
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 
+from fastapi.responses import JSONResponse
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GoogleRequest
 
@@ -21,6 +22,23 @@ from google.auth.transport.requests import Request as GoogleRequest
 # =====================================================
 
 app = FastAPI()
+
+# =====================================================
+# AUTH MIDDLEWARE - validates RENDER_WORKER_SECRET
+# =====================================================
+
+RENDER_WORKER_SECRET = os.environ.get("RENDER_WORKER_SECRET", "")
+
+def verify_worker_auth(request: Request) -> bool:
+    """Check Authorization Bearer or X-Worker-Secret header."""
+    if not RENDER_WORKER_SECRET:
+        return True  # skip if not configured (dev mode)
+    auth = request.headers.get("Authorization", "")
+    if auth == f"Bearer {RENDER_WORKER_SECRET}":
+        return True
+    if request.headers.get("X-Worker-Secret", "") == RENDER_WORKER_SECRET:
+        return True
+    return False
 
 # =====================================================
 # ENV VARIABLES
@@ -430,7 +448,10 @@ async def update_supabase_failed(generation_id: str, error_message: str):
 # =====================================================
 
 @app.post("/generate-video")
-async def generate_video(req: GenerateVideoRequest):
+async def generate_video(req: GenerateVideoRequest, request: Request):
+
+    if not verify_worker_auth(request):
+        return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
 
     try:
 
@@ -475,7 +496,10 @@ async def generate_video(req: GenerateVideoRequest):
 # =====================================================
 
 @app.post("/merge-videos")
-async def merge_videos(req: MergeVideosRequest):
+async def merge_videos(req: MergeVideosRequest, request: Request):
+
+    if not verify_worker_auth(request):
+        return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
 
     try:
 
@@ -591,8 +615,8 @@ SCRAPER_SECRET = os.environ.get("SCRAPER_SECRET", "")
 @app.post("/scrape-trending")
 async def scrape_trending(request: Request):
     secret = request.headers.get("X-Scraper-Secret", "")
-    if SCRAPER_SECRET and secret != SCRAPER_SECRET:
-        return {"status": "error", "message": "Unauthorized"}
+    if not SCRAPER_SECRET or secret != SCRAPER_SECRET:
+        return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
     try:
         from scraper import run_scraper
         result = await run_scraper()
