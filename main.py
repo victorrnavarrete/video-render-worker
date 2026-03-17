@@ -293,7 +293,8 @@ async def call_veo(
                 "extra limbs, missing limbs, anatomical errors, "
                 "subtitle, caption, on-screen text, logo, "
                 "bokeh, shallow depth of field, blurry background, out of focus background, "
-                "background music, soundtrack, musical score, singing, humming"
+                "background music, soundtrack, musical score, singing, humming, "
+                "sound effects, swoosh, whoosh, dramatic audio, cinematic audio, artificial reverb"
             )
         }
     }
