@@ -292,7 +292,8 @@ async def call_veo(
                 "unrealistic, artifacts, glitch, flickering, watermark, text, "
                 "extra limbs, missing limbs, anatomical errors, "
                 "subtitle, caption, on-screen text, logo, "
-                "bokeh, shallow depth of field, blurry background, out of focus background"
+                "bokeh, shallow depth of field, blurry background, out of focus background, "
+                "background music, soundtrack, musical score, singing, humming"
             )
         }
     }
