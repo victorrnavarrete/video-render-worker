@@ -13,6 +13,8 @@ from typing import Optional, List
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 
+from sora2_engine import call_sora, map_aspect_to_sora_size, resize_image_for_sora
+
 from fastapi.responses import JSONResponse
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GoogleRequest
@@ -90,6 +92,7 @@ class GenerateVideoRequest(BaseModel):
     duration: Optional[int] = None
     video_quality: Optional[str] = None
     model: Optional[str] = None
+    engine: Optional[str] = None
 
 class ClipConfig(BaseModel):
     url: str
@@ -311,8 +314,10 @@ async def call_veo(
                 "extra limbs, missing limbs, anatomical errors, "
                 "subtitle, caption, on-screen text, logo, "
                 "bokeh, shallow depth of field, blurry background, out of focus background, "
-                "background music, soundtrack, musical score, singing, humming, "
-                "sound effects, swoosh, whoosh, dramatic audio, cinematic audio, artificial reverb"
+                "background music, soundtrack, musical score, singing, humming, jingle, beats, "
+                "sound effects, swoosh, whoosh, impact sound, transition sound, riser, stinger, "
+                "chime, ding, pop, click, dramatic audio, cinematic audio, orchestral, synth pad, "
+                "artificial reverb, echo effect, audio filter, applause, laughter track"
             )
         }
     }
@@ -457,8 +462,9 @@ async def generate_video(req: GenerateVideoRequest, request: Request):
 
         veo_model = req.model or "veo-3.1-generate-preview"
         duration = req.duration or 8
+        selected_engine = req.engine or "veo3"
 
-        print(f"Starting Veo generation: {req.generation_id} | model={veo_model} | duration={duration}s")
+        print(f"Starting generation: {req.generation_id} | engine={selected_engine} | model={veo_model} | duration={duration}s")
 
         aspect = req.aspect_ratio or "9:16"
 
@@ -468,13 +474,22 @@ async def generate_video(req: GenerateVideoRequest, request: Request):
 
         enhanced_prompt = build_veo_prompt(req)
 
-        video_url = await call_veo(
-            image_bytes,
-            enhanced_prompt,
-            aspect_ratio=aspect,
-            duration_seconds=duration,
-            model=veo_model,
-        )
+        if selected_engine == "sora2":
+            # Sora 2 path: resize image to exact output resolution, then call Sora API
+            # call_sora picks the right model (sora-2 vs sora-2-pro) based on duration
+            sora_size = map_aspect_to_sora_size(aspect)
+            sora_image = resize_image_for_sora(image_bytes, sora_size)
+            video_bytes = await call_sora(sora_image, enhanced_prompt, aspect, duration)
+            video_url = await upload_video_to_supabase(video_bytes)
+        else:
+            # Veo3 path (default — no changes)
+            video_url = await call_veo(
+                image_bytes,
+                enhanced_prompt,
+                aspect_ratio=aspect,
+                duration_seconds=duration,
+                model=veo_model,
+            )
 
         await update_supabase(req.generation_id, video_url)
 
