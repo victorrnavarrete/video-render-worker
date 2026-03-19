@@ -235,6 +235,12 @@ def parse_veo_error(raw_error: str) -> str:
             "Tente reformular o script removendo nomes especificos."
         )
 
+    if "moderation_blocked" in err:
+        return (
+            "O conteudo foi bloqueado pela moderacao do Sora (OpenAI). "
+            "Tente simplificar o script ou usar o motor Veo 3."
+        )
+
     if "safety" in err or "content_filter" in err or "blocked" in err:
         return (
             "O conteudo foi bloqueado pelas politicas de seguranca da IA. "

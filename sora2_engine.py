@@ -75,17 +75,51 @@ def resize_image_for_sora(image_bytes: bytes, target_size: str) -> bytes:
 
 def build_sora_prompt(base_prompt: str) -> str:
     """
-    Wrap the base prompt with Sora-specific identity/clothing preservation
-    instructions. Sora tends to alter clothing — we reinforce preservation.
+    Clean and adapt the Veo3 prompt for Sora 2.
+    - Removes verbose audio/technical sections that trigger Sora moderation
+    - Adds clothing/identity preservation instructions
+    - Keeps only the essential behavioral/visual instructions
     """
-    sora_prefix = (
-        "CRITICAL: Preserve EXACTLY the person's identity, face, skin, hair, "
-        "and clothing from the reference image. Do NOT change, add, or remove "
-        "any clothing items. The outfit must remain identical to the source image "
-        "throughout the entire video — same colors, same style, same fit. "
-        "Photorealistic quality. No AI artifacts.\n\n"
+    import re
+
+    # Remove sections that are Veo3-specific or trigger Sora moderation
+    cleaned = base_prompt
+
+    # Remove full section blocks (SECTION_TITLE\n...content...\n\n)
+    sections_to_remove = [
+        r"AUDIO RULE \(MANDATORY\)[\s\S]*?(?=\n\n[A-Z]|\Z)",
+        r"AUDIO REMINDER[\s\S]*?(?=\n\n[A-Z]|\Z)",
+        r"LIPSYNC REQUIREMENTS[\s\S]*?(?=\n\n[A-Z]|\Z)",
+        r"IDENTITY LOCK \(HIGHEST PRIORITY\)[\s\S]*?(?=\n\n[A-Z]|\Z)",
+        r"REALISM REQUIREMENTS[\s\S]*?(?=\n\n[A-Z]|\Z)",
+        r"OUTPUT[\s\S]*?(?=\n\n[A-Z]|\Z)",
+    ]
+    for pattern in sections_to_remove:
+        cleaned = re.sub(pattern, "", cleaned)
+
+    # Remove Veo3 quality suffix
+    cleaned = re.sub(r"photorealistic\. 4K quality\..*?video\s*$", "", cleaned, flags=re.MULTILINE)
+
+    # Remove leftover double newlines
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    sora_prompt = (
+        "Animate this reference image into a realistic video. "
+        "Preserve EXACTLY the person's identity, face, skin, hair, "
+        "and clothing from the image. Do NOT change any clothing items — "
+        "same outfit, same colors, same style throughout the entire video. "
+        "Photorealistic quality. Natural lighting. Smooth motion.\n\n"
     )
-    return sora_prefix + base_prompt
+
+    if cleaned:
+        sora_prompt += cleaned
+
+    # Cap prompt length — Sora works better with shorter prompts
+    if len(sora_prompt) > 1500:
+        sora_prompt = sora_prompt[:1500].rsplit(" ", 1)[0]
+
+    print(f"Sora prompt built: {len(sora_prompt)} chars (original: {len(base_prompt)} chars)")
+    return sora_prompt
 
 
 async def call_sora(
