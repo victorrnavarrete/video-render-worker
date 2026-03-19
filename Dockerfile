@@ -35,5 +35,6 @@ RUN playwright install chromium
 
 COPY main.py .
 COPY scraper.py .
+COPY sora2_engine.py .
 EXPOSE 8080
 CMD ["sh", "-c", "echo \"$GOOGLE_APPLICATION_CREDENTIALS_JSON\" > /tmp/service-account.json && uvicorn main:app --host 0.0.0.0 --port 8080"]
