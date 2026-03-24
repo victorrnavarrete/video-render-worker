@@ -94,6 +94,10 @@ class GenerateVideoRequest(BaseModel):
     model: Optional[str] = None
     engine: Optional[str] = None
     custom_instructions: Optional[str] = None
+    # Pet video fields
+    is_pet: Optional[bool] = False
+    background_reference_url: Optional[str] = None
+    product_image_url: Optional[str] = None
 
 class ClipConfig(BaseModel):
     url: str
@@ -142,6 +146,75 @@ async def download_image_bytes(url: str):
         response.raise_for_status()
 
         return response.content
+
+
+async def compose_pet_image(
+    pet_bytes: bytes,
+    background_url: str = None,
+    product_url: str = None,
+    target_ratio: str = "9:16",
+) -> bytes:
+    """
+    Compose a single reference image for pet video generation.
+    When background is provided, place the pet on top of the background.
+    When product is provided, overlay it in the bottom-right corner.
+    This gives Veo3/Sora2 visual context for the scene.
+    """
+    w_ratio, h_ratio = map(int, target_ratio.split(":"))
+    # Target canvas size
+    if w_ratio > h_ratio:
+        canvas_w, canvas_h = 1280, int(1280 * h_ratio / w_ratio)
+    else:
+        canvas_w, canvas_h = int(1280 * w_ratio / h_ratio), 1280
+
+    pet_img = Image.open(io.BytesIO(pet_bytes)).convert("RGB")
+
+    if background_url:
+        try:
+            bg_bytes = await download_image_bytes(background_url)
+            bg_img = Image.open(io.BytesIO(bg_bytes)).convert("RGB")
+            # Resize background to fill canvas
+            bg_img = bg_img.resize((canvas_w, canvas_h), Image.LANCZOS)
+            canvas = bg_img
+            # Resize pet to fit ~60% of canvas height, centered
+            pet_h = int(canvas_h * 0.65)
+            pet_w = int(pet_img.width * pet_h / pet_img.height)
+            pet_resized = pet_img.resize((pet_w, pet_h), Image.LANCZOS)
+            # Center pet on canvas
+            x = (canvas_w - pet_w) // 2
+            y = canvas_h - pet_h - int(canvas_h * 0.05)
+            canvas.paste(pet_resized, (x, y))
+            print(f"Pet composed on background: canvas={canvas_w}x{canvas_h}")
+        except Exception as e:
+            print(f"Failed to compose background, using pet only: {e}")
+            canvas = pet_img.resize((canvas_w, canvas_h), Image.LANCZOS)
+    else:
+        canvas = pet_img.resize((canvas_w, canvas_h), Image.LANCZOS)
+
+    if product_url:
+        try:
+            prod_bytes = await download_image_bytes(product_url)
+            prod_img = Image.open(io.BytesIO(prod_bytes)).convert("RGBA")
+            # Resize product to ~25% of canvas height
+            prod_h = int(canvas_h * 0.25)
+            prod_w = int(prod_img.width * prod_h / prod_img.height)
+            prod_resized = prod_img.resize((prod_w, prod_h), Image.LANCZOS)
+            # Place in bottom-right corner with margin
+            margin = int(canvas_w * 0.03)
+            px = canvas_w - prod_w - margin
+            py = canvas_h - prod_h - margin
+            # Handle transparency
+            if prod_resized.mode == "RGBA":
+                canvas.paste(prod_resized, (px, py), prod_resized)
+            else:
+                canvas.paste(prod_resized, (px, py))
+            print(f"Product composed at ({px},{py}), size={prod_w}x{prod_h}")
+        except Exception as e:
+            print(f"Failed to compose product: {e}")
+
+    buf = io.BytesIO()
+    canvas.save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
 
 # =====================================================
 # CROP IMAGE TO ASPECT RATIO (pre-processamento)
@@ -476,13 +549,24 @@ async def generate_video(req: GenerateVideoRequest, request: Request):
         duration = req.duration or 8
         selected_engine = req.engine or "veo3"
 
-        print(f"Starting generation: {req.generation_id} | engine={selected_engine} | model={veo_model} | duration={duration}s")
+        is_pet = req.is_pet or False
+        print(f"Starting generation: {req.generation_id} | engine={selected_engine} | model={veo_model} | duration={duration}s | pet={is_pet}")
 
         aspect = req.aspect_ratio or "9:16"
 
         image_bytes = await download_image_bytes(req.image_url)
 
-        image_bytes = crop_image_to_ratio(image_bytes, aspect)
+        # For pet videos with background/product, compose a single reference image
+        if is_pet and (req.background_reference_url or req.product_image_url):
+            print(f"Pet mode: composing image with bg={bool(req.background_reference_url)}, product={bool(req.product_image_url)}")
+            image_bytes = await compose_pet_image(
+                image_bytes,
+                background_url=req.background_reference_url,
+                product_url=req.product_image_url,
+                target_ratio=aspect,
+            )
+        else:
+            image_bytes = crop_image_to_ratio(image_bytes, aspect)
 
         if selected_engine == "sora2":
             # Sora 2 path: use raw prompt (build_sora_prompt handles cleanup internally)
