@@ -101,7 +101,7 @@ def build_sora_prompt(base_prompt: str, custom_instructions: str = None) -> str:
     sections_to_remove = [
         r"AUDIO RULE \(MANDATORY\)[\s\S]*?(?=\n\n[A-Z]|\Z)",
         r"AUDIO REMINDER[\s\S]*?(?=\n\n[A-Z]|\Z)",
-        r"LIPSYNC REQUIREMENTS[\s\S]*?(?=\n\n[A-Z]|\Z)",
+        # LIPSYNC REQUIREMENTS is kept — critical for natural mouth movement
         r"IDENTITY LOCK \(HIGHEST PRIORITY\)[\s\S]*?(?=\n\n[A-Z]|\Z)",
         r"REALISM REQUIREMENTS[\s\S]*?(?=\n\n[A-Z]|\Z)",
         r"OUTPUT[\s\S]*?(?=\n\n[A-Z]|\Z)",

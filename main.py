@@ -319,6 +319,8 @@ async def call_veo(
                 "deformation, morphing, distortion, blurry, low quality, "
                 "unrealistic, artifacts, glitch, flickering, watermark, text, "
                 "extra limbs, missing limbs, anatomical errors, "
+                "distorted mouth, misaligned lips, jaw deformation, mouth warping, "
+                "asymmetrical mouth, uncanny mouth, teeth artifacts, "
                 "subtitle, caption, on-screen text, logo, "
                 "bokeh, shallow depth of field, blurry background, out of focus background, "
                 "background music, soundtrack, musical score, singing, humming, jingle, beats, "
