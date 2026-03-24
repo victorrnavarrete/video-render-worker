@@ -122,6 +122,9 @@ def build_sora_prompt(base_prompt: str, custom_instructions: str = None) -> str:
         "Preserve EXACTLY the person's identity, face, skin, hair, "
         "and clothing from the image. Do NOT change any clothing items — "
         "same outfit, same colors, same style throughout the entire video. "
+        "Any product in the image must remain EXACTLY as shown — no deformation, "
+        "no morphing, no bending. Product label, text, logo, and packaging must "
+        "stay sharp, legible, and unchanged. The product is a rigid physical object. "
         "Photorealistic quality. Natural lighting. Smooth motion.\n\n"
     )
 
