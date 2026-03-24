@@ -73,19 +73,31 @@ def resize_image_for_sora(image_bytes: bytes, target_size: str) -> bytes:
         return image_bytes
 
 
-def build_sora_prompt(base_prompt: str) -> str:
+def build_sora_prompt(base_prompt: str, custom_instructions: str = None) -> str:
     """
     Clean and adapt the Veo3 prompt for Sora 2.
+    - Extracts and prioritizes custom instructions (placed at the top)
     - Removes verbose audio/technical sections that trigger Sora moderation
     - Adds clothing/identity preservation instructions
     - Keeps only the essential behavioral/visual instructions
     """
     import re
 
-    # Remove sections that are Veo3-specific or trigger Sora moderation
-    cleaned = base_prompt
+    # 1. Extract custom instructions BEFORE stripping (they'd survive regex
+    #    but could be truncated at the end). Use structured param if available.
+    user_instructions = (custom_instructions or "").strip()
+    if not user_instructions:
+        # Fallback: extract from prompt blob
+        match = re.search(
+            r"IMPORTANT USER INSTRUCTIONS\s*\(MUST FOLLOW\)\s*\n([\s\S]*?)(?=\n\n[A-Z]|\Z)",
+            base_prompt,
+        )
+        if match:
+            user_instructions = match.group(1).strip()
+            print(f"Sora: extracted custom instructions from prompt ({len(user_instructions)} chars)")
 
-    # Remove full section blocks (SECTION_TITLE\n...content...\n\n)
+    # 2. Remove sections that are Veo3-specific or trigger Sora moderation
+    cleaned = base_prompt
     sections_to_remove = [
         r"AUDIO RULE \(MANDATORY\)[\s\S]*?(?=\n\n[A-Z]|\Z)",
         r"AUDIO REMINDER[\s\S]*?(?=\n\n[A-Z]|\Z)",
@@ -93,16 +105,18 @@ def build_sora_prompt(base_prompt: str) -> str:
         r"IDENTITY LOCK \(HIGHEST PRIORITY\)[\s\S]*?(?=\n\n[A-Z]|\Z)",
         r"REALISM REQUIREMENTS[\s\S]*?(?=\n\n[A-Z]|\Z)",
         r"OUTPUT[\s\S]*?(?=\n\n[A-Z]|\Z)",
+        r"IMPORTANT USER INSTRUCTIONS\s*\(MUST FOLLOW\)[\s\S]*?(?=\n\n[A-Z]|\Z)",
     ]
     for pattern in sections_to_remove:
         cleaned = re.sub(pattern, "", cleaned)
 
-    # Remove Veo3 quality suffix
+    # Remove Veo3 quality suffix (added by build_veo_prompt)
     cleaned = re.sub(r"photorealistic\. 4K quality\..*?video\s*$", "", cleaned, flags=re.MULTILINE)
 
     # Remove leftover double newlines
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
+    # 3. Build Sora prompt with custom instructions at the TOP (Sora weights early instructions more)
     sora_prompt = (
         "Animate this reference image into a realistic video. "
         "Preserve EXACTLY the person's identity, face, skin, hair, "
@@ -111,14 +125,21 @@ def build_sora_prompt(base_prompt: str) -> str:
         "Photorealistic quality. Natural lighting. Smooth motion.\n\n"
     )
 
+    # Place user instructions right after identity block — highest priority position
+    if user_instructions:
+        sora_prompt += f"MUST FOLLOW: {user_instructions}\n\n"
+        print(f"Sora: custom instructions placed at top ({len(user_instructions)} chars)")
+
     if cleaned:
         sora_prompt += cleaned
 
-    # Cap prompt length — Sora works better with shorter prompts
-    if len(sora_prompt) > 1500:
-        sora_prompt = sora_prompt[:1500].rsplit(" ", 1)[0]
+    # 4. Smart truncation: preserve top (identity + custom instructions) and trim from the end
+    MAX_SORA_PROMPT = 2000
+    if len(sora_prompt) > MAX_SORA_PROMPT:
+        sora_prompt = sora_prompt[:MAX_SORA_PROMPT].rsplit("\n", 1)[0]
 
-    print(f"Sora prompt built: {len(sora_prompt)} chars (original: {len(base_prompt)} chars)")
+    print(f"Sora prompt built: {len(sora_prompt)} chars (original: {len(base_prompt)} chars, "
+          f"custom_instructions: {len(user_instructions)} chars)")
     return sora_prompt
 
 
@@ -127,6 +148,7 @@ async def call_sora(
     prompt: str,
     aspect_ratio: str = "9:16",
     duration_seconds: int = 8,
+    custom_instructions: str = None,
 ) -> bytes:
     """
     Generate video via OpenAI Sora 2 API.
@@ -141,7 +163,7 @@ async def call_sora(
 
     sora_size = map_aspect_to_sora_size(aspect_ratio)
     sora_model, sora_duration = pick_sora_model_and_duration(duration_seconds)
-    sora_prompt = build_sora_prompt(prompt)
+    sora_prompt = build_sora_prompt(prompt, custom_instructions=custom_instructions)
 
     print(f"Sora: model={sora_model}, size={sora_size}, duration={sora_duration}s, "
           f"requested={duration_seconds}s, prompt_len={len(sora_prompt)}")

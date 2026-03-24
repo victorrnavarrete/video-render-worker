@@ -93,6 +93,7 @@ class GenerateVideoRequest(BaseModel):
     video_quality: Optional[str] = None
     model: Optional[str] = None
     engine: Optional[str] = None
+    custom_instructions: Optional[str] = None
 
 class ClipConfig(BaseModel):
     url: str
@@ -478,17 +479,19 @@ async def generate_video(req: GenerateVideoRequest, request: Request):
 
         image_bytes = crop_image_to_ratio(image_bytes, aspect)
 
-        enhanced_prompt = build_veo_prompt(req)
-
         if selected_engine == "sora2":
-            # Sora 2 path: resize image to exact output resolution, then call Sora API
-            # call_sora picks the right model (sora-2 vs sora-2-pro) based on duration
+            # Sora 2 path: use raw prompt (build_sora_prompt handles cleanup internally)
+            # Pass custom_instructions as structured data for priority placement
             sora_size = map_aspect_to_sora_size(aspect)
             sora_image = resize_image_for_sora(image_bytes, sora_size)
-            video_bytes = await call_sora(sora_image, enhanced_prompt, aspect, duration)
+            video_bytes = await call_sora(
+                sora_image, req.prompt, aspect, duration,
+                custom_instructions=req.custom_instructions,
+            )
             video_url = await upload_video_to_supabase(video_bytes)
         else:
             # Veo3 path (default — no changes)
+            enhanced_prompt = build_veo_prompt(req)
             video_url = await call_veo(
                 image_bytes,
                 enhanced_prompt,
