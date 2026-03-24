@@ -130,7 +130,7 @@ def build_sora_prompt(base_prompt: str, custom_instructions: str = None) -> str:
 
     # Place user instructions right after identity block — highest priority position
     if user_instructions:
-        sora_prompt += f"MUST FOLLOW: {user_instructions}\n\n"
+        sora_prompt += f"MANDATORY USER INSTRUCTIONS (MUST FOLLOW EXACTLY — overrides any default behavior):\n{user_instructions}\n\n"
         print(f"Sora: custom instructions placed at top ({len(user_instructions)} chars)")
 
     if cleaned:
