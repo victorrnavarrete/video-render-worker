@@ -163,6 +163,7 @@ async def call_sora(
     aspect_ratio: str = "9:16",
     duration_seconds: int = 8,
     custom_instructions: str = None,
+    model_override: str = None,
 ) -> bytes:
     """
     Generate video via OpenAI Sora 2 API.
@@ -176,7 +177,8 @@ async def call_sora(
         raise Exception("OPENAI_API_KEY not configured")
 
     sora_size = map_aspect_to_sora_size(aspect_ratio)
-    sora_model, sora_duration = pick_sora_model_and_duration(duration_seconds)
+    _, sora_duration = pick_sora_model_and_duration(duration_seconds)
+    sora_model = model_override if model_override in ("sora-2", "sora-2-pro") else "sora-2"
     sora_prompt = build_sora_prompt(prompt, custom_instructions=custom_instructions)
 
     print(f"Sora: model={sora_model}, size={sora_size}, duration={sora_duration}s, "
@@ -211,7 +213,7 @@ async def call_sora(
             else:
                 print(f"WARNING: Supabase upload failed ({upload_res.status_code}), falling back to multipart")
 
-    # Step 1b: Submit generation
+    # Step 1b: Submit generation and poll
     async with httpx.AsyncClient(timeout=600) as client:
         if image_public_url:
             # JSON format with image_url (new API format)

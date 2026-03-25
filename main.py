@@ -93,6 +93,7 @@ class GenerateVideoRequest(BaseModel):
     video_quality: Optional[str] = None
     model: Optional[str] = None
     engine: Optional[str] = None
+    sora_model: Optional[str] = None
     custom_instructions: Optional[str] = None
     # Pet video fields
     is_pet: Optional[bool] = False
@@ -576,6 +577,7 @@ async def generate_video(req: GenerateVideoRequest, request: Request):
             video_bytes = await call_sora(
                 sora_image, req.prompt, aspect, duration,
                 custom_instructions=req.custom_instructions,
+                model_override=req.sora_model,
             )
             video_url = await upload_video_to_supabase(video_bytes)
         else:
