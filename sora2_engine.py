@@ -214,7 +214,8 @@ async def call_sora(
                 print(f"WARNING: Supabase upload failed ({upload_res.status_code}), falling back to multipart")
 
     # Step 1b: Submit generation and poll
-    async with httpx.AsyncClient(timeout=600) as client:
+    # Use shorter timeout for submit (60s) and longer for polling/download (2min per request)
+    async with httpx.AsyncClient(timeout=60) as client:
         if image_public_url:
             # JSON format with image_url (new API format)
             json_body = {
@@ -265,14 +266,28 @@ async def call_sora(
         print(f"Sora generation started: video_id={video_id}")
 
         # Step 2: Poll until completed or failed
+        # Use a dedicated client with generous timeout for polling (each request is light)
         poll_url = f"https://api.openai.com/v1/videos/{video_id}"
         max_polls = 120  # 120 * 15s = 30 minutes max
+        max_retries = 3  # retries per poll on transient errors
         for i in range(max_polls):
             await asyncio.sleep(15)
 
-            poll_res = await client.get(poll_url, headers=headers)
-            poll_res.raise_for_status()
-            poll_data = poll_res.json()
+            # Retry on transient errors (network hiccups, 5xx)
+            poll_data = None
+            for attempt in range(max_retries):
+                try:
+                    poll_res = await client.get(poll_url, headers=headers, timeout=30)
+                    poll_res.raise_for_status()
+                    poll_data = poll_res.json()
+                    break
+                except (httpx.HTTPStatusError, httpx.TransportError) as e:
+                    if attempt < max_retries - 1:
+                        print(f"Sora poll [{i+1}] attempt {attempt+1} failed: {e}, retrying in 5s...")
+                        await asyncio.sleep(5)
+                    else:
+                        print(f"Sora poll [{i+1}] failed after {max_retries} attempts: {e}")
+                        raise Exception(f"Sora polling failed after {max_retries} retries: {e}")
 
             status = poll_data.get("status", "unknown")
             print(f"Sora poll [{i+1}]: status={status}")
@@ -285,10 +300,10 @@ async def call_sora(
         else:
             raise Exception("Sora generation timed out after 30 minutes")
 
-        # Step 3: Download video content
+        # Step 3: Download video content (may be large, use longer timeout)
         print("Downloading Sora video...")
         download_url = f"https://api.openai.com/v1/videos/{video_id}/content"
-        download_res = await client.get(download_url, headers=headers)
+        download_res = await client.get(download_url, headers=headers, timeout=120)
         download_res.raise_for_status()
 
         video_bytes = download_res.content
