@@ -1,10 +1,12 @@
 """
 Sora 2 (OpenAI) video generation engine.
-Provides image-to-video generation as an alternative to Veo 3.
+Provides image-to-video generation with synchronized audio.
 
 Models:
-  - sora-2:     valid seconds = 4, 8, 12
-  - sora-2-pro: valid seconds = 10, 15, 25
+  - sora-2:     standard quality
+  - sora-2-pro: higher quality
+
+Valid seconds (both models): 4, 8, 12, 16, 20
 
 Resolutions (both models):
   - 720x1280  (9:16 portrait)
@@ -28,11 +30,8 @@ SORA_SIZES = {
 }
 SORA_FALLBACK_SIZE = "1280x720"
 
-# Duration → model mapping
-# sora-2:     4, 8, 12
-# sora-2-pro: 10, 15, 25
-SORA_STANDARD_DURATIONS = [4, 8, 12]
-SORA_PRO_DURATIONS = [10, 15, 25]
+# Valid durations for both sora-2 and sora-2-pro
+SORA_VALID_DURATIONS = [4, 8, 12, 16, 20]
 
 
 def map_aspect_to_sora_size(aspect_ratio: str) -> str:
@@ -43,15 +42,11 @@ def map_aspect_to_sora_size(aspect_ratio: str) -> str:
 def pick_sora_model_and_duration(requested_seconds: int) -> tuple[str, int]:
     """
     Pick the best model + duration combo for the requested seconds.
-    - Up to 12s → sora-2 (standard) with nearest valid duration
-    - Above 12s → sora-2-pro with nearest valid duration (10, 15, 25)
+    Both sora-2 and sora-2-pro accept 4, 8, 12, 16, 20.
+    Use sora-2-pro for higher quality.
     """
-    if requested_seconds <= 12:
-        best = min(SORA_STANDARD_DURATIONS, key=lambda d: abs(d - requested_seconds))
-        return "sora-2", best
-    else:
-        best = min(SORA_PRO_DURATIONS, key=lambda d: abs(d - requested_seconds))
-        return "sora-2-pro", best
+    best = min(SORA_VALID_DURATIONS, key=lambda d: abs(d - requested_seconds))
+    return "sora-2-pro", best
 
 
 def resize_image_for_sora(image_bytes: bytes, target_size: str) -> bytes:
@@ -102,7 +97,7 @@ def build_sora_prompt(base_prompt: str, custom_instructions: str = None) -> str:
     sections_to_remove = [
         r"AUDIO RULE \(MANDATORY\)[\s\S]*?(?=\n\n[A-Z]|\Z)",
         r"AUDIO REMINDER[\s\S]*?(?=\n\n[A-Z]|\Z)",
-        # LIPSYNC REQUIREMENTS is kept — critical for natural mouth movement
+        # SPEECH and LIPSYNC are kept — Sora generates synchronized audio
         r"IDENTITY LOCK \(HIGHEST PRIORITY\)[\s\S]*?(?=\n\n[A-Z]|\Z)",
         r"REALISM REQUIREMENTS[\s\S]*?(?=\n\n[A-Z]|\Z)",
         r"OUTPUT[\s\S]*?(?=\n\n[A-Z]|\Z)",
