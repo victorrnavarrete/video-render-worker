@@ -209,7 +209,7 @@ async def call_sora(
                 "model": sora_model,
                 "prompt": sora_prompt,
                 "size": sora_size,
-                "seconds": sora_duration,
+                "seconds": str(sora_duration),
                 "input_reference": {
                     "image_url": image_public_url,
                 },
