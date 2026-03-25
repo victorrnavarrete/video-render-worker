@@ -15,6 +15,7 @@ Image input must match video output resolution exactly.
 
 import os
 import io
+import uuid
 import asyncio
 import httpx
 from PIL import Image
@@ -175,25 +176,71 @@ async def call_sora(
         "Authorization": f"Bearer {api_key}",
     }
 
-    # Step 1: Submit generation (multipart form data)
-    async with httpx.AsyncClient(timeout=600) as client:
-        files = {
-            "input_reference": ("image.png", image_bytes, "image/png"),
-        }
-        form_data = {
-            "model": sora_model,
-            "prompt": sora_prompt,
-            "size": sora_size,
-            "seconds": str(sora_duration),
-        }
+    # Step 1: Upload reference image to Supabase Storage to get a public URL
+    # (Sora API now requires input_reference as a JSON object with image_url)
+    supabase_url = os.environ.get("SUPABASE_URL")
+    supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    image_public_url = None
 
-        print(f"Submitting to Sora API: model={sora_model}, seconds={sora_duration}, size={sora_size}")
-        submit_res = await client.post(
-            "https://api.openai.com/v1/videos",
-            headers=headers,
-            files=files,
-            data=form_data,
-        )
+    if supabase_url and supabase_key:
+        file_name = f"sora-ref-{uuid.uuid4().hex[:12]}.png"
+        upload_url = f"{supabase_url}/storage/v1/object/creative-media/{file_name}"
+        async with httpx.AsyncClient(timeout=30) as upload_client:
+            upload_res = await upload_client.post(
+                upload_url,
+                headers={
+                    "apikey": supabase_key,
+                    "Authorization": f"Bearer {supabase_key}",
+                    "Content-Type": "image/png",
+                },
+                content=image_bytes,
+            )
+            if upload_res.status_code in (200, 201):
+                image_public_url = f"{supabase_url}/storage/v1/object/public/creative-media/{file_name}"
+                print(f"Sora reference image uploaded: {image_public_url}")
+            else:
+                print(f"WARNING: Supabase upload failed ({upload_res.status_code}), falling back to multipart")
+
+    # Step 1b: Submit generation
+    async with httpx.AsyncClient(timeout=600) as client:
+        if image_public_url:
+            # JSON format with image_url (new API format)
+            json_body = {
+                "model": sora_model,
+                "prompt": sora_prompt,
+                "size": sora_size,
+                "seconds": sora_duration,
+                "input_reference": {
+                    "image_url": image_public_url,
+                },
+            }
+            headers["Content-Type"] = "application/json"
+
+            print(f"Submitting to Sora API (JSON): model={sora_model}, seconds={sora_duration}, size={sora_size}")
+            submit_res = await client.post(
+                "https://api.openai.com/v1/videos",
+                headers=headers,
+                json=json_body,
+            )
+        else:
+            # Fallback: multipart form data (legacy format)
+            files = {
+                "input_reference": ("image.png", image_bytes, "image/png"),
+            }
+            form_data = {
+                "model": sora_model,
+                "prompt": sora_prompt,
+                "size": sora_size,
+                "seconds": str(sora_duration),
+            }
+
+            print(f"Submitting to Sora API (multipart): model={sora_model}, seconds={sora_duration}, size={sora_size}")
+            submit_res = await client.post(
+                "https://api.openai.com/v1/videos",
+                headers=headers,
+                files=files,
+                data=form_data,
+            )
 
         if submit_res.status_code not in (200, 201):
             raise Exception(f"Sora submit failed [{submit_res.status_code}]: {submit_res.text}")
