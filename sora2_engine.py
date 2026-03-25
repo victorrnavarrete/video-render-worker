@@ -72,18 +72,15 @@ def resize_image_for_sora(image_bytes: bytes, target_size: str) -> bytes:
 def build_sora_prompt(base_prompt: str, custom_instructions: str = None) -> str:
     """
     Clean and adapt the Veo3 prompt for Sora 2.
-    - Extracts and prioritizes custom instructions (placed at the top)
-    - Removes verbose audio/technical sections that trigger Sora moderation
-    - Adds clothing/identity preservation instructions
-    - Keeps only the essential behavioral/visual instructions
+    - Extracts SPEECH and custom instructions and places them at the TOP
+    - Removes verbose/Veo3-specific sections
+    - Keeps camera, face, body instructions
     """
     import re
 
-    # 1. Extract custom instructions BEFORE stripping (they'd survive regex
-    #    but could be truncated at the end). Use structured param if available.
+    # 1. Extract custom instructions
     user_instructions = (custom_instructions or "").strip()
     if not user_instructions:
-        # Fallback: extract from prompt blob
         match = re.search(
             r"IMPORTANT USER INSTRUCTIONS\s*\(MUST FOLLOW\)\s*\n([\s\S]*?)(?=\n\n[A-Z]|\Z)",
             base_prompt,
@@ -92,12 +89,23 @@ def build_sora_prompt(base_prompt: str, custom_instructions: str = None) -> str:
             user_instructions = match.group(1).strip()
             print(f"Sora: extracted custom instructions from prompt ({len(user_instructions)} chars)")
 
-    # 2. Remove sections that are Veo3-specific or trigger Sora moderation
+    # 2. Extract SPEECH section BEFORE removing it (to place at top)
+    speech_text = ""
+    speech_match = re.search(
+        r"SPEECH.*?\n([\s\S]*?)(?=\n\n[A-Z]|\Z)",
+        base_prompt,
+    )
+    if speech_match:
+        speech_text = speech_match.group(0).strip()
+        print(f"Sora: extracted SPEECH block ({len(speech_text)} chars)")
+
+    # 3. Remove sections that are Veo3-specific or redundant for Sora
     cleaned = base_prompt
     sections_to_remove = [
-        r"AUDIO RULE \(MANDATORY\)[\s\S]*?(?=\n\n[A-Z]|\Z)",
+        r"AUDIO RULE[\s\S]*?(?=\n\n[A-Z]|\Z)",
         r"AUDIO REMINDER[\s\S]*?(?=\n\n[A-Z]|\Z)",
-        # SPEECH and LIPSYNC are kept — Sora generates synchronized audio
+        r"SPEECH.*?\n[\s\S]*?(?=\n\n[A-Z]|\Z)",
+        r"LIPSYNC REQUIREMENTS[\s\S]*?(?=\n\n[A-Z]|\Z)",
         r"IDENTITY LOCK \(HIGHEST PRIORITY\)[\s\S]*?(?=\n\n[A-Z]|\Z)",
         r"REALISM REQUIREMENTS[\s\S]*?(?=\n\n[A-Z]|\Z)",
         r"OUTPUT[\s\S]*?(?=\n\n[A-Z]|\Z)",
@@ -106,14 +114,18 @@ def build_sora_prompt(base_prompt: str, custom_instructions: str = None) -> str:
     for pattern in sections_to_remove:
         cleaned = re.sub(pattern, "", cleaned)
 
-    # Remove Veo3 quality suffix (added by build_veo_prompt)
     cleaned = re.sub(r"photorealistic\. 4K quality\..*?video\s*$", "", cleaned, flags=re.MULTILINE)
-
-    # Remove leftover double newlines
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
-    # 3. Build Sora prompt with custom instructions at the TOP (Sora weights early instructions more)
-    sora_prompt = (
+    # 4. Build Sora prompt — SPEECH at the very top for maximum priority
+    parts = []
+
+    # Speech FIRST — Sora weights early instructions more heavily
+    if speech_text:
+        parts.append(speech_text)
+
+    # Identity/clothing block
+    parts.append(
         "Animate this reference image into a realistic video. "
         "Preserve EXACTLY the person's identity, face, skin, hair, "
         "and clothing from the image. Do NOT change any clothing items — "
@@ -121,24 +133,27 @@ def build_sora_prompt(base_prompt: str, custom_instructions: str = None) -> str:
         "Any product in the image must remain EXACTLY as shown — no deformation, "
         "no morphing, no bending. Product label, text, logo, and packaging must "
         "stay sharp, legible, and unchanged. The product is a rigid physical object. "
-        "Photorealistic quality. Natural lighting. Smooth motion.\n\n"
+        "Photorealistic quality. Natural lighting. Smooth motion."
     )
 
-    # Place user instructions right after identity block — highest priority position
+    # Custom instructions right after identity
     if user_instructions:
-        sora_prompt += f"MANDATORY USER INSTRUCTIONS (MUST FOLLOW EXACTLY — overrides any default behavior):\n{user_instructions}\n\n"
-        print(f"Sora: custom instructions placed at top ({len(user_instructions)} chars)")
+        parts.append(f"MANDATORY USER INSTRUCTIONS (MUST FOLLOW EXACTLY):\n{user_instructions}")
+        print(f"Sora: custom instructions placed near top ({len(user_instructions)} chars)")
 
+    # Remaining behavioral instructions (camera, face, body)
     if cleaned:
-        sora_prompt += cleaned
+        parts.append(cleaned)
 
-    # 4. Smart truncation: preserve top (identity + custom instructions) and trim from the end
+    sora_prompt = "\n\n".join(parts)
+
+    # 5. Smart truncation: preserve top (speech + identity) and trim from the end
     MAX_SORA_PROMPT = 2000
     if len(sora_prompt) > MAX_SORA_PROMPT:
         sora_prompt = sora_prompt[:MAX_SORA_PROMPT].rsplit("\n", 1)[0]
 
     print(f"Sora prompt built: {len(sora_prompt)} chars (original: {len(base_prompt)} chars, "
-          f"custom_instructions: {len(user_instructions)} chars)")
+          f"speech: {len(speech_text)} chars, custom: {len(user_instructions)} chars)")
     return sora_prompt
 
 
