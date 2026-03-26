@@ -3,14 +3,10 @@ Sora 2 (OpenAI) video generation engine.
 Provides image-to-video generation with synchronized audio.
 
 Models:
-  - sora-2:     standard quality
-  - sora-2-pro: higher quality
+  - sora-2:     standard quality (720p)
+  - sora-2-pro: higher quality (1080p)
 
 Valid seconds (both models): 4, 8, 12, 16, 20
-
-Resolutions (both models):
-  - 720x1280  (9:16 portrait)
-  - 1280x720  (16:9 landscape)
 
 Image input must match video output resolution exactly.
 """
@@ -23,19 +19,26 @@ import httpx
 from PIL import Image
 
 
-# Sora 2 supported resolutions (720p only for standard model)
+# Sora 2 supported resolutions
 SORA_SIZES = {
     "9:16": "720x1280",
     "16:9": "1280x720",
 }
+SORA_SIZES_PRO = {
+    "9:16": "1080x1920",
+    "16:9": "1920x1080",
+}
 SORA_FALLBACK_SIZE = "1280x720"
+SORA_FALLBACK_SIZE_PRO = "1920x1080"
 
 # Valid durations for both sora-2 and sora-2-pro
 SORA_VALID_DURATIONS = [4, 8, 12, 16, 20]
 
 
-def map_aspect_to_sora_size(aspect_ratio: str) -> str:
-    """Map aspect ratio string to Sora 2 resolution. Fallback to 1280x720."""
+def map_aspect_to_sora_size(aspect_ratio: str, model: str = "sora-2") -> str:
+    """Map aspect ratio string to Sora resolution. Pro uses 1080p, standard uses 720p."""
+    if model == "sora-2-pro":
+        return SORA_SIZES_PRO.get(aspect_ratio, SORA_FALLBACK_SIZE_PRO)
     return SORA_SIZES.get(aspect_ratio, SORA_FALLBACK_SIZE)
 
 
@@ -176,9 +179,9 @@ async def call_sora(
     if not api_key:
         raise Exception("OPENAI_API_KEY not configured")
 
-    sora_size = map_aspect_to_sora_size(aspect_ratio)
     _, sora_duration = pick_sora_model_and_duration(duration_seconds)
     sora_model = model_override if model_override in ("sora-2", "sora-2-pro") else "sora-2"
+    sora_size = map_aspect_to_sora_size(aspect_ratio, sora_model)
     sora_prompt = build_sora_prompt(prompt, custom_instructions=custom_instructions)
 
     print(f"Sora: model={sora_model}, size={sora_size}, duration={sora_duration}s, "

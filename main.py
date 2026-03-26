@@ -572,7 +572,8 @@ async def generate_video(req: GenerateVideoRequest, request: Request):
         if selected_engine == "sora2":
             # Sora 2 path: use raw prompt (build_sora_prompt handles cleanup internally)
             # Pass custom_instructions as structured data for priority placement
-            sora_size = map_aspect_to_sora_size(aspect)
+            sora_model_name = req.sora_model if req.sora_model in ("sora-2", "sora-2-pro") else "sora-2"
+            sora_size = map_aspect_to_sora_size(aspect, sora_model_name)
             sora_image = resize_image_for_sora(image_bytes, sora_size)
             video_bytes = await call_sora(
                 sora_image, req.prompt, aspect, duration,
