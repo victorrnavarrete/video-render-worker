@@ -356,7 +356,7 @@ async def call_veo(
     prompt: str,
     aspect_ratio: str = "9:16",
     duration_seconds: int = 8,
-    model: str = "veo-3.1-generate-preview",
+    model: str = "veo-3.1-fast-generate-001",
 ):
 
     token = get_access_token()
@@ -546,7 +546,7 @@ async def generate_video(req: GenerateVideoRequest, request: Request):
 
     try:
 
-        veo_model = req.model or "veo-3.1-generate-preview"
+        veo_model = req.model or "veo-3.1-fast-generate-001"
         duration = req.duration or 8
         selected_engine = req.engine or "veo3"
 
