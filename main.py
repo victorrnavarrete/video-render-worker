@@ -739,3 +739,184 @@ async def scrape_trending(request: Request):
         return result
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+# =====================================================
+# WATERMARK CONFIG
+# =====================================================
+# Path to the local watermark PNG shipped with the worker
+WATERMARK_PATH = os.path.join(os.path.dirname(__file__), "watermark.png")
+
+def _load_watermark() -> Image.Image:
+    """Load the watermark PNG (white text on transparent bg, 400x100)."""
+    return Image.open(WATERMARK_PATH).convert("RGBA")
+
+# =====================================================
+# ENDPOINT: WATERMARK IMAGE
+# =====================================================
+
+@app.post("/watermark-image")
+async def watermark_image(request: Request):
+    """
+    Receives an image URL, applies a diagonal repeated VICTORIA watermark,
+    and uploads the result to Supabase Storage. Returns the public URL.
+    """
+    if not verify_worker_auth(request):
+        return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
+
+    try:
+        body = await request.json()
+        image_url = body["image_url"]
+        generation_id = body.get("generation_id", str(uuid.uuid4()))
+
+        print(f"[watermark-image] Starting for generation={generation_id}")
+
+        # Download source image
+        img_bytes = await download_image_bytes(image_url)
+        base_img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+        w, h = base_img.size
+
+        # Load watermark and scale relative to image (watermark width = ~30% of image width)
+        wm = _load_watermark()
+        wm_scale = max(1, int(w * 0.30 / wm.width))
+        wm_resized = wm.resize((wm.width * wm_scale, wm.height * wm_scale), Image.LANCZOS)
+
+        # Create overlay with diagonal repeated pattern
+        overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        wm_w, wm_h = wm_resized.size
+        # Step between watermarks: ~1.5x the watermark size
+        step_x = int(wm_w * 1.5)
+        step_y = int(wm_h * 2.5)
+
+        for y_off in range(-h, h * 2, step_y):
+            for x_off in range(-w, w * 2, step_x):
+                # Diagonal offset: shift every other row
+                row_idx = (y_off + h) // step_y
+                x_shift = (step_x // 2) * (row_idx % 2)
+                px, py = x_off + x_shift, y_off
+
+                # Rotate watermark 30 degrees for diagonal effect
+                wm_rotated = wm_resized.rotate(30, expand=True, resample=Image.BICUBIC)
+                if 0 - wm_rotated.width < px < w and 0 - wm_rotated.height < py < h:
+                    overlay.paste(wm_rotated, (px, py), wm_rotated)
+
+        # Composite
+        result = Image.alpha_composite(base_img, overlay)
+        result_rgb = result.convert("RGB")
+
+        # Save to bytes
+        buf = io.BytesIO()
+        result_rgb.save(buf, format="JPEG", quality=92)
+        result_bytes = buf.getvalue()
+
+        # Upload to Supabase Storage
+        file_name = f"watermarked/{generation_id}.jpg"
+        upload_url = f"{SUPABASE_URL}/storage/v1/object/creative-media/{file_name}"
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "image/jpeg",
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(upload_url, headers=headers, content=result_bytes)
+            resp.raise_for_status()
+
+        public_url = f"{SUPABASE_URL}/storage/v1/object/public/creative-media/{file_name}"
+        print(f"[watermark-image] Done: {public_url}")
+        return {"status": "success", "image_url": public_url}
+
+    except Exception as e:
+        print(f"[watermark-image] ERROR: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+# =====================================================
+# ENDPOINT: WATERMARK VIDEO
+# =====================================================
+
+@app.post("/watermark-video")
+async def watermark_video(request: Request):
+    """
+    Receives a video URL, applies a diagonal repeated VICTORIA watermark via FFmpeg,
+    and uploads the result to Supabase Storage. Returns the public URL.
+    """
+    if not verify_worker_auth(request):
+        return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
+
+    try:
+        body = await request.json()
+        video_url = body["video_url"]
+        generation_id = body.get("generation_id", str(uuid.uuid4()))
+
+        print(f"[watermark-video] Starting for generation={generation_id}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Download video
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.get(video_url)
+                resp.raise_for_status()
+                video_path = os.path.join(tmpdir, "input.mp4")
+                with open(video_path, "wb") as f:
+                    f.write(resp.content)
+
+            # Probe video dimensions
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height",
+                 "-of", "csv=s=x:p=0", video_path],
+                capture_output=True, text=True
+            )
+            vid_w, vid_h = 1080, 1920  # defaults
+            if probe.stdout.strip():
+                parts = probe.stdout.strip().split("x")
+                if len(parts) == 2:
+                    vid_w, vid_h = int(parts[0]), int(parts[1])
+
+            # Create a tiled watermark image matching video dimensions
+            wm = _load_watermark()
+            wm_scale = max(1, int(vid_w * 0.30 / wm.width))
+            wm_resized = wm.resize((wm.width * wm_scale, wm.height * wm_scale), Image.LANCZOS)
+            wm_rotated = wm_resized.rotate(30, expand=True, resample=Image.BICUBIC)
+
+            # Build full-frame watermark overlay
+            overlay = Image.new("RGBA", (vid_w, vid_h), (0, 0, 0, 0))
+            wm_w, wm_h = wm_rotated.size
+            step_x = int(wm_w * 1.5)
+            step_y = int(wm_h * 2.5)
+            for y_off in range(-vid_h, vid_h * 2, step_y):
+                for x_off in range(-vid_w, vid_w * 2, step_x):
+                    row_idx = (y_off + vid_h) // step_y
+                    x_shift = (step_x // 2) * (row_idx % 2)
+                    px, py = x_off + x_shift, y_off
+                    if 0 - wm_w < px < vid_w and 0 - wm_h < py < vid_h:
+                        overlay.paste(wm_rotated, (px, py), wm_rotated)
+
+            overlay_path = os.path.join(tmpdir, "overlay.png")
+            overlay.save(overlay_path)
+
+            # FFmpeg: overlay watermark on video
+            output_path = os.path.join(tmpdir, "output.mp4")
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-i", overlay_path,
+                "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "copy",
+                output_path
+            ]
+            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise Exception(f"FFmpeg error: {result.stderr[:500]}")
+
+            # Read output and upload
+            with open(output_path, "rb") as f:
+                output_bytes = f.read()
+
+            file_name = f"watermarked/{generation_id}.mp4"
+            public_url = await upload_video_to_supabase(output_bytes, file_name)
+            print(f"[watermark-video] Done: {public_url}")
+            return {"status": "success", "video_url": public_url}
+
+    except Exception as e:
+        print(f"[watermark-video] ERROR: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
