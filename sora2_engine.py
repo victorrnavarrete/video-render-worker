@@ -72,12 +72,13 @@ def resize_image_for_sora(image_bytes: bytes, target_size: str) -> bytes:
         return image_bytes
 
 
-def build_sora_prompt(base_prompt: str, custom_instructions: str = None) -> str:
+def build_sora_prompt(base_prompt: str, custom_instructions: str = None, prompt_language: str = "pt") -> str:
     """
     Clean and adapt the Veo3 prompt for Sora 2.
     - Extracts SPEECH and custom instructions and places them at the TOP
     - Removes verbose/Veo3-specific sections
     - Keeps camera, face, body instructions
+    - Adds explicit language/accent instruction for speech
     """
     import re
 
@@ -123,7 +124,19 @@ def build_sora_prompt(base_prompt: str, custom_instructions: str = None) -> str:
     # 4. Build Sora prompt — SPEECH at the very top for maximum priority
     parts = []
 
-    # Speech FIRST — Sora weights early instructions more heavily
+    # Language instruction FIRST — critical for correct accent
+    if prompt_language == "pt":
+        parts.append(
+            "LANGUAGE & ACCENT (CRITICAL): The person MUST speak in Brazilian Portuguese "
+            "(pt-BR accent). Do NOT use European Portuguese (pt-PT). The accent, pronunciation, "
+            "and intonation must sound like a native Brazilian speaker."
+        )
+    else:
+        parts.append(
+            "LANGUAGE & ACCENT: The person speaks in American English with natural pronunciation."
+        )
+
+    # Speech SECOND — Sora weights early instructions more heavily
     if speech_text:
         parts.append(speech_text)
 
@@ -167,6 +180,7 @@ async def call_sora(
     duration_seconds: int = 8,
     custom_instructions: str = None,
     model_override: str = None,
+    prompt_language: str = "pt",
 ) -> bytes:
     """
     Generate video via OpenAI Sora 2 API.
@@ -182,7 +196,7 @@ async def call_sora(
     _, sora_duration = pick_sora_model_and_duration(duration_seconds)
     sora_model = model_override if model_override in ("sora-2", "sora-2-pro") else "sora-2"
     sora_size = map_aspect_to_sora_size(aspect_ratio, sora_model)
-    sora_prompt = build_sora_prompt(prompt, custom_instructions=custom_instructions)
+    sora_prompt = build_sora_prompt(prompt, custom_instructions=custom_instructions, prompt_language=prompt_language)
 
     print(f"Sora: model={sora_model}, size={sora_size}, duration={sora_duration}s, "
           f"requested={duration_seconds}s, prompt_len={len(sora_prompt)}")
