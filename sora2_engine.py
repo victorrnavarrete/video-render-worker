@@ -103,6 +103,19 @@ def build_sora_prompt(base_prompt: str, custom_instructions: str = None, prompt_
         speech_text = speech_match.group(0).strip()
         print(f"Sora: extracted SPEECH block ({len(speech_text)} chars)")
 
+    # 2b. Inject language hint directly into the speech block (most effective for Sora)
+    if speech_text and prompt_language == "pt":
+        # Add Brazilian accent instruction right before the speech content
+        speech_text = speech_text.replace(
+            'The person says:',
+            'The person says (in Brazilian Portuguese accent from Brazil, NOT European Portuguese from Portugal):'
+        )
+        # Also append accent reminder at the end of the speech block
+        speech_text += (
+            "\nACCENT REMINDER: Brazilian Portuguese (pt-BR) accent — open vowels, "
+            "Brazilian cadence and intonation. NOT Portuguese from Portugal."
+        )
+
     # 3. Remove sections that are Veo3-specific or redundant for Sora
     cleaned = base_prompt
     sections_to_remove = [
@@ -114,6 +127,7 @@ def build_sora_prompt(base_prompt: str, custom_instructions: str = None, prompt_
         r"REALISM REQUIREMENTS[\s\S]*?(?=\n\n[A-Z]|\Z)",
         r"OUTPUT[\s\S]*?(?=\n\n[A-Z]|\Z)",
         r"IMPORTANT USER INSTRUCTIONS\s*\(MUST FOLLOW\)[\s\S]*?(?=\n\n[A-Z]|\Z)",
+        r"LANGUAGE & ACCENT[\s\S]*?(?=\n\n[A-Z]|\Z)",
     ]
     for pattern in sections_to_remove:
         cleaned = re.sub(pattern, "", cleaned)
