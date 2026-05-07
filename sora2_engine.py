@@ -127,9 +127,12 @@ def build_sora_prompt(base_prompt: str, custom_instructions: str = None, prompt_
     # Language instruction FIRST — critical for correct accent
     if prompt_language == "pt":
         parts.append(
-            "LANGUAGE & ACCENT (CRITICAL): The person MUST speak in Brazilian Portuguese "
-            "(pt-BR accent). Do NOT use European Portuguese (pt-PT). The accent, pronunciation, "
-            "and intonation must sound like a native Brazilian speaker."
+            "LANGUAGE & ACCENT (CRITICAL — HIGHEST PRIORITY): The person MUST speak in Brazilian Portuguese "
+            "(pt-BR accent from Brazil). ABSOLUTELY DO NOT use European Portuguese (pt-PT from Portugal). "
+            "The accent, pronunciation, and intonation must sound like a native Brazilian speaker from São Paulo or Rio de Janeiro. "
+            "Brazilian vocabulary: use 'você' (not 'tu'), 'legal' (not 'fixe'), 'ônibus' (not 'autocarro'), "
+            "'celular' (not 'telemóvel'), 'trem' (not 'comboio'). "
+            "Open vowels and Brazilian cadence — NOT the closed vowels of Portugal."
         )
     else:
         parts.append(
